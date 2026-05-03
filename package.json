@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:tauri": "vite --port 1420 --strictPort",
     "build": "tsc -b && vite build",
     "desktop:build": "npm run build && tauri build",
     "lint": "eslint .",
@@ -16,16 +17,22 @@
   "dependencies": {
     "@fontsource/inter": "^5.2.8",
     "@fontsource/jetbrains-mono": "^5.2.8",
+    "@tanstack/react-query": "^5.90.0",
     "@tauri-apps/api": "^2.9.1",
+    "cmdk": "^1.1.1",
     "framer-motion": "^12.38.0",
     "leaflet": "^1.9.4",
     "lucide-react": "^1.14.0",
+    "pyodide": "^0.29.3",
     "react": "^19.2.5",
     "react-diff-viewer-continued": "^4.2.2",
     "react-dom": "^19.2.5",
     "react-force-graph-2d": "^1.29.1",
     "react-leaflet": "^5.0.0",
-    "recharts": "^2.15.0"
+    "react-resizable-panels": "^2.1.9",
+    "recharts": "^2.15.0",
+    "sonner": "^2.0.7",
+    "zustand": "^5.0.9"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

@@ -76,4 +76,34 @@ def ensure_sqlite_migrations() -> None:
         if "schema_summary" not in col_names:
             conn.execute(text("ALTER TABLE cases ADD COLUMN schema_summary JSON"))
 
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS case_workbench_pins (
+                    case_id VARCHAR(36) PRIMARY KEY REFERENCES cases(id) ON DELETE CASCADE,
+                    pins_json JSON NOT NULL,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+
         conn.execute(text("UPDATE leads SET status = 'DISMISSED' WHERE status = 'CLOSED'"))
+
+        rows = conn.execute(text("PRAGMA table_info(cases)")).fetchall()
+        col_names = {r[1] for r in rows}
+        if "tenant_id" not in col_names:
+            conn.execute(text("ALTER TABLE cases ADD COLUMN tenant_id VARCHAR(128) NOT NULL DEFAULT 'default'"))
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS case_shares (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_case_id VARCHAR(36) NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+                    viewer_case_id VARCHAR(36) NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+                    UNIQUE(owner_case_id, viewer_case_id)
+                )
+                """
+            )
+        )

@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
+
 import polars as pl
+
+from backend.tools.amount_input import parse_loose_amount
 
 _USER_HINTS = frozenset(
     {"userid", "user_id", "customerid", "account", "accountid", "buyerid"},
@@ -38,7 +42,7 @@ def _status_lower(col: str) -> pl.Expr:
 def trust_velocity_forensic_scan(
     dataset_path: str | Path,
     *,
-    target_amount: float | None = None,
+    target_amount: Any = None,
     transaction_id: str | None = None,
     max_rows: int | None = 2_000_000,
 ) -> dict[str, Any]:
@@ -46,6 +50,11 @@ def trust_velocity_forensic_scan(
     Locate a focal disputed (or high-signal) row, compare the user's completed history (warm-up),
     IP/device reuse, and amount ratio. Emits ``kind: forensic_verdict_card`` for the console UI.
     """
+    ta_parsed = parse_loose_amount(target_amount) if target_amount is not None else None
+    if ta_parsed is not None and ta_parsed <= 0:
+        ta_parsed = None
+    target_amount = ta_parsed
+
     path = Path(dataset_path)
     if not path.is_file():
         return {"ok": False, "error": f"Dataset not found: {path}", "kind": "forensic_verdict_card"}

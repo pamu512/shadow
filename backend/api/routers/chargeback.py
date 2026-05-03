@@ -9,6 +9,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
+from backend.database.dataset_path_resolve import resolve_with_active_fallback
 from backend.database.models import Case
 from backend.schemas import SimulateRepresentmentRequest
 from backend.tools.chargeback_analyzer import analyze_chargeback_risk
@@ -33,19 +34,21 @@ def chargeback_simulate_representment(
 ) -> dict[str, Any]:
     """LLM role-play: issuing bank analyst judges whether merchant evidence is likely strong enough."""
     case = _get_case(case_id, db)
-    if not case.dataset_path:
+    path = resolve_with_active_fallback(db, case.dataset_path)
+    if not path:
         raise HTTPException(status_code=400, detail="Case has no dataset.")
     tid = (body.transaction_id.strip() if body and body.transaction_id else None) or None
-    return simulate_issuer_representment_review(case.dataset_path, transaction_id=tid)
+    return simulate_issuer_representment_review(path, transaction_id=tid)
 
 
 @router.post("/{case_id}/chargeback/analyze")
 def chargeback_analyze(case_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     """Run friendly-fraud / chargeback evidence scan on the case CSV."""
     case = _get_case(case_id, db)
-    if not case.dataset_path:
+    path = resolve_with_active_fallback(db, case.dataset_path)
+    if not path:
         raise HTTPException(status_code=400, detail="Case has no dataset; upload a CSV first.")
-    return analyze_chargeback_risk(case.dataset_path)
+    return analyze_chargeback_risk(path)
 
 
 @router.get("/{case_id}/chargeback/manifest")
@@ -56,9 +59,10 @@ def chargeback_manifest(
 ) -> dict[str, Any]:
     """JSON Representment Manifest for one transaction."""
     case = _get_case(case_id, db)
-    if not case.dataset_path:
+    path = resolve_with_active_fallback(db, case.dataset_path)
+    if not path:
         raise HTTPException(status_code=400, detail="Case has no dataset.")
-    return build_representment_manifest(transaction_id.strip(), case.dataset_path)
+    return build_representment_manifest(transaction_id.strip(), path)
 
 
 @router.get("/{case_id}/chargeback/package.zip")
@@ -69,12 +73,13 @@ def chargeback_package_zip(
 ) -> Response:
     """Zip export: representment_manifest.json + REPRESENTMENT_SUMMARY.txt."""
     case = _get_case(case_id, db)
-    if not case.dataset_path:
+    path = resolve_with_active_fallback(db, case.dataset_path)
+    if not path:
         raise HTTPException(status_code=400, detail="Case has no dataset.")
-    manifest = build_representment_manifest(transaction_id.strip(), case.dataset_path)
+    manifest = build_representment_manifest(transaction_id.strip(), path)
     if not manifest.get("ok"):
         raise HTTPException(status_code=400, detail=manifest.get("error", "Manifest build failed"))
-    analysis = analyze_chargeback_risk(case.dataset_path)
+    analysis = analyze_chargeback_risk(path)
     summary = ""
     if isinstance(analysis, dict) and analysis.get("ok"):
         summary = "\n".join(analysis.get("executive_summary") or [])[:8000]

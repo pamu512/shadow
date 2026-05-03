@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, func, text
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.case_status import DEFAULT_CASE_STATUS
+from backend.data.tenant_constants import DEFAULT_TENANT_ID
 from backend.database.session import Base
 
 
@@ -14,6 +16,12 @@ class Case(Base):
     __tablename__ = "cases"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        default=DEFAULT_TENANT_ID,
+        server_default=text(f"'{DEFAULT_TENANT_ID}'"),
+    )
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     dataset_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=False)
@@ -35,6 +43,35 @@ class Case(Base):
     audit_logs: Mapped[list[AuditLog]] = relationship(
         "AuditLog", back_populates="case", cascade="all, delete-orphan"
     )
+    workbench_pins: Mapped["CaseWorkbenchPins | None"] = relationship(
+        "CaseWorkbenchPins",
+        back_populates="case",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class CaseShare(Base):
+    """Allow ``viewer_case_id`` to include ``owner_case_id`` warehouse rows in scoped queries."""
+
+    __tablename__ = "case_shares"
+    __table_args__ = (UniqueConstraint("owner_case_id", "viewer_case_id", name="uq_case_share_pair"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_case_id: Mapped[str] = mapped_column(String(36), ForeignKey("cases.id", ondelete="CASCADE"), nullable=False)
+    viewer_case_id: Mapped[str] = mapped_column(String(36), ForeignKey("cases.id", ondelete="CASCADE"), nullable=False)
+
+
+class CaseWorkbenchPins(Base):
+    """Pinned forensic cards for the workspace strip (persisted per case)."""
+
+    __tablename__ = "case_workbench_pins"
+
+    case_id: Mapped[str] = mapped_column(String(36), ForeignKey("cases.id", ondelete="CASCADE"), primary_key=True)
+    pins_json: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    case: Mapped[Case] = relationship("Case", back_populates="workbench_pins")
 
 
 class Lead(Base):

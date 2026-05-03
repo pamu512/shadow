@@ -30,7 +30,16 @@ def execute_code(
             "violations": violations,
         }
     if language == "r":
-        exit_code, stdout, stderr, plots = run_rscript(code, timeout_sec=timeout_sec)
+        try:
+            exit_code, stdout, stderr, plots = run_rscript(code, timeout_sec=timeout_sec)
+        except RuntimeError as exc:
+            return {
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": str(exc),
+                "plots_base64": [],
+                "violations": [],
+            }
         return {
             "exit_code": exit_code,
             "stdout": stdout,

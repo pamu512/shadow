@@ -1,16 +1,11 @@
 import { useMemo, useState } from 'react'
 import { ChevronDown, ChevronRight, Pin } from 'lucide-react'
+import type { PinnedForensicPayload } from '../../lib/types'
 import { GhostButton } from '../ui/ForensicChrome'
 import { getComponentForOutput, getOutputKind } from './SpecializedOutputRenderer'
 import { renderTextWithEntityChips } from './EntityChip'
 
-export type PinnedForensicPayload = {
-  id: string
-  title: string
-  subtitle: string
-  payload: Record<string, unknown>
-  pinnedAt: number
-}
+export type { PinnedForensicPayload }
 
 type Props = {
   payload: Record<string, unknown>

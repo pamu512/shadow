@@ -1,6 +1,8 @@
 """DuckDB-backed CSV ingestion into per-case analytical stores."""
 from __future__ import annotations
 
+import io
+import logging
 import re
 import shutil
 import uuid
@@ -8,10 +10,53 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import polars as pl
 
 from backend.config import settings
+from backend.database.duckdb_lock import duckdb_lock_path
 
+_log = logging.getLogger(__name__)
 LARGE_TABLE_ROWS = 250_000
+
+
+def read_csv_to_polars(path: Path) -> pl.DataFrame:
+    """
+    Fault-tolerant CSV read: encoding sniff, Polars first, Pandas fallback for malformed rows.
+    """
+    raw = path.read_bytes()
+    if not raw:
+        return pl.DataFrame()
+    text: str
+    try:
+        import chardet
+
+        enc = chardet.detect(raw[:200_000]) or {}
+        name = (enc.get("encoding") or "utf-8").lower()
+        if name in ("ascii", None):
+            name = "utf-8"
+        text = raw.decode(name, errors="replace")
+    except Exception:  # noqa: BLE001
+        text = raw.decode("utf-8", errors="replace")
+
+    buf = io.StringIO(text)
+    try:
+        return pl.read_csv(buf, infer_schema_length=50_000, try_parse_dates=True)
+    except Exception as polars_exc:  # noqa: BLE001
+        _log.warning("Polars read_csv failed (%s); trying Pandas fallback", polars_exc)
+        try:
+            import pandas as pd
+
+            buf.seek(0)
+            pdf = pd.read_csv(
+                buf,
+                on_bad_lines="warn",
+                engine="python",
+                encoding_errors="replace",
+            )
+            return pl.from_pandas(pdf)
+        except Exception as pd_exc:  # noqa: BLE001
+            _log.warning("Pandas CSV fallback failed: %s", pd_exc)
+            raise polars_exc from pd_exc
 
 
 def _configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
@@ -66,17 +111,24 @@ class IngestionEngine:
         duck_path = self.duckdb_root / f"{case_id}.duckdb"
         csv_abs = dest_csv.resolve()
 
-        con = duckdb.connect(str(duck_path))
-        try:
-            _configure_duckdb(con)
-            con.execute("DROP TABLE IF EXISTS dataset")
-            con.execute(
-                "CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, header=true)",
-                [str(csv_abs)],
-            )
-            summary = self._schema_summary(con)
-        finally:
-            con.close()
+        with duckdb_lock_path(duck_path):
+            con = duckdb.connect(str(duck_path))
+            try:
+                _configure_duckdb(con)
+                con.execute("DROP TABLE IF EXISTS dataset")
+                df = read_csv_to_polars(csv_abs)
+                tmp_csv = case_dir / f"._mat_{uuid.uuid4().hex}.csv"
+                try:
+                    df.write_csv(tmp_csv)
+                    con.execute(
+                        "CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, header=true)",
+                        [str(tmp_csv.resolve())],
+                    )
+                finally:
+                    tmp_csv.unlink(missing_ok=True)
+                summary = self._schema_summary(con)
+            finally:
+                con.close()
 
         return dest_csv, duck_path, summary
 
@@ -127,18 +179,19 @@ class IngestionEngine:
         if not duck_path.is_file():
             raise FileNotFoundError("Case analytical database not found; ingest a dataset first.")
 
-        con = duckdb.connect(str(duck_path), read_only=True)
-        try:
+        with duckdb_lock_path(duck_path):
+            con = duckdb.connect(str(duck_path), read_only=True)
             try:
-                _configure_duckdb(con)
-            except Exception:  # noqa: BLE001
-                pass
-            rel = con.sql(stmt)
-            cols = [str(c) for c in rel.columns]
-            rows = [list(r) for r in rel.fetchall()]
-            return cols, rows
-        finally:
-            con.close()
+                try:
+                    _configure_duckdb(con)
+                except Exception:  # noqa: BLE001
+                    pass
+                rel = con.sql(stmt)
+                cols = [str(c) for c in rel.columns]
+                rows = [list(r) for r in rel.fetchall()]
+                return cols, rows
+            finally:
+                con.close()
 
 
 def new_lead_id() -> str:

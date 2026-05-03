@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend.config import settings
 from backend.database import get_db
+from backend.database.dataset_path_resolve import resolve_with_active_fallback
 from backend.database.models import Case
 from backend.schemas import BotBulkSuspendRequest
 from backend.agent.tools_langchain import _try_emit_bot_hardware_lead
@@ -20,14 +21,14 @@ router = APIRouter(prefix="/api/cases", tags=["bots"])
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _resolve_case_csv_for_detection(case: Case) -> Path:
+def _resolve_case_csv_for_detection(case: Case, db: Session) -> Path:
     """
     Resolve the on-disk CSV for bot detection.
 
     Upload flow stores an absolute path, but older rows or different host cwd can leave paths that
     only resolve from repo root, workspace, or the per-case datasets folder.
     """
-    raw = (case.dataset_path or "").strip()
+    raw = (resolve_with_active_fallback(db, case.dataset_path) or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="Case has no dataset_path; upload a CSV first.")
     p = Path(raw).expanduser()
@@ -65,7 +66,7 @@ def _get_case(case_id: str, db: Session) -> Case:
 @router.post("/{case_id}/bots/detect")
 def bot_detect_clusters(case_id: str, db: Session = Depends(get_db)) -> dict:
     case = _get_case(case_id, db)
-    csv_path = _resolve_case_csv_for_detection(case)
+    csv_path = _resolve_case_csv_for_detection(case, db)
     out = detect_bot_clusters(csv_path)
     _try_emit_bot_hardware_lead(case_id, out)
     return out

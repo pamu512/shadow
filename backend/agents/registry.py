@@ -2,7 +2,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final, Literal
+
+
+def _fraud_playbook_system_prompt() -> str:
+    p = Path(__file__).resolve().parent / "fraud_playbook_context.md"
+    if p.is_file():
+        return p.read_text(encoding="utf-8").strip()
+    return (
+        "[Fraud playbook file missing: backend/agents/fraud_playbook_context.md]\n"
+        "You are still a Fraud Risk Architect; use general fraud analytics until the playbook is restored."
+    )
+
 
 AgentType = Literal["general", "ato", "bot", "chargeback", "network", "promo", "collusion"]
 
@@ -41,11 +53,15 @@ class FraudAgent:
                 "or name datasets such as the **Humanoid** stress test, you are **STRICTLY FORBIDDEN** from asking the "
                 "operator for that data, permission to upload it, or “please provide the file.” Assume the evidence "
                 "already exists in the **GlobalWarehouse (DuckDB)** and retrieve it with tools.\n"
-                "**First-step rule (cross-case intent):** Your first tool call must be **search_historical_overlap_tool** "
-                "for each inferable entity **or** a **warehouse_query_tool** / **warehouse_search_text_tool** read that "
-                "targets `source_case_id`, `row_json`, or filenames mentioned in the prompt—**before** "
-                "**get_dataset_schema** unless the question is purely a single-file column definition with zero linkage "
-                "intent.\n"
+                "**First-step rule (cross-case intent only):** When the user clearly wants **cross-case** evidence—"
+                "other investigations, warehouse/SQL, Humanoid linkage, or entity recurrence—your **first invoked tool** "
+                "(via the runtime, not JSON you print) should be **search_historical_overlap_tool** for each **concrete** "
+                "entity id they gave, **or** **warehouse_query_tool** / **warehouse_search_text_tool** on needles they "
+                "named—**before** **get_dataset_schema**, unless they only need local column definitions with **no** "
+                "cross-case angle.\n"
+                "**Exclusion:** Questions that are **only** about investigation **planning**, **prioritized hypotheses**, "
+                "methodology, or checklists (e.g. “what should I validate first?” with no “pull my data / scan this case”) "
+                "→ answer in **plain prose**; **no** tools and **no** fake tool-call JSON.\n"
                 "**Humanoid stress test:** If the prompt references Humanoid, call **humanoid_stress_test_linkage_tool** "
                 "(stress IP `1.1.1.1` + `canvas_fingerprint` / device alignment vs the active case). When the tool returns "
                 "`required_narrative`, you MUST paste that exact sentence into your reply.\n"
@@ -67,7 +83,23 @@ _GENERAL_TOOLS: Final[frozenset[str]] = frozenset(
         "warehouse_query_tool",
         "warehouse_search_text_tool",
         "humanoid_stress_test_linkage_tool",
+        "knowledge_retriever",
     },
+)
+
+_PLAYBOOK_ARCHITECT_TOOLS: Final[frozenset[str]] = frozenset(
+    _GENERAL_TOOLS
+    | frozenset(
+        {
+            "execute_in_sandbox",
+            "find_fraud_rings_tool",
+            "profile_fraud_ring_roles_tool",
+            "analyze_chargeback_risk_tool",
+            "canvas_ip_velocity_tool",
+            "isolation_forest_scan_tool",
+            "xgboost_fraud_train_tool",
+        },
+    ),
 )
 
 FRAUD_AGENT_REGISTRY: dict[str, FraudAgent] = {
@@ -80,11 +112,12 @@ FRAUD_AGENT_REGISTRY: dict[str, FraudAgent] = {
             "Prioritize falsifiable hypotheses, quantify impact (dwell, velocity, concentration), "
             "and separate common noise from coordinated or systemic abuse. When data is thin, "
             "say what you would need to confirm or deny each hypothesis.\n\n"
-            "**Global View:** You are the only persona with organization-wide warehouse SQL. For any question about "
-            "whether an entity or pattern **appeared in other investigations**, you are **forbidden** from asking the "
-            "operator for files or permission—query the GlobalWarehouse (DuckDB) with overlap search and read-only SQL. "
-            "Frame findings using **Infrastructure Overlap**, **Sleeper Account Detection**, and **Entity Recidivism** when "
-            "the warehouse supports those readings.\n\n"
+            "**Global View (when they want evidence):** You have organization-wide warehouse SQL. When the operator "
+            "asks you to **verify**, **pull**, **search**, or **prove** cross-case history—not when they only want "
+            "hypothesis priorities or methodology—you are **forbidden** from asking for files or permission; query "
+            "GlobalWarehouse (DuckDB) with overlap search and read-only SQL. "
+            "Frame findings using **Infrastructure Overlap**, **Sleeper Account Detection**, and **Entity Recidivism** "
+            "only when tool JSON supports those readings.\n\n"
             "**Hardware / canvas fingerprints in the warehouse:** Treat a **canvas_fingerprint** or hardware hash string "
             "as **`device_id`** for **search_historical_overlap_tool** (entity_type=`device_id`, entity_id=the exact hash). "
             "Also run **warehouse_search_text_tool** with that hash (and separately with any named user id, e.g. "
@@ -116,7 +149,10 @@ FRAUD_AGENT_REGISTRY: dict[str, FraudAgent] = {
         ),
         allowed_tool_names=_GENERAL_TOOLS,
         thinking_protocol=(
-            "Chain-of-thought: (1) Restate the hypothesis in measurable terms. "
+            "Chain-of-thought: (0) If they only want **planning**, **hypothesis priorities**, a ranked hypothesis list, "
+            "or methodology with **no** data/warehouse pull, answer in plain English—**no tools**, no `{\"name\":...}` "
+            "JSON, no fake “search results.” "
+            "(1) Otherwise restate the hypothesis in measurable terms. "
             "(2) If the operator mentions **Humanoid** (stress test), call **humanoid_stress_test_linkage_tool** before "
             "general narration; it probes stress IP **1.1.1.1** and **canvas_fingerprint** / device alignment vs this case. "
             "(3) If they ask to **cross-reference**, **global warehouse**, **canvas / hardware hash** history, or a named "
@@ -180,6 +216,7 @@ FRAUD_AGENT_REGISTRY: dict[str, FraudAgent] = {
                 "analyze_chargeback_risk_tool",
                 "build_representment_manifest_tool",
                 "simulate_representment_tool",
+                "knowledge_retriever",
             }
         ),
         thinking_protocol=(
@@ -238,6 +275,8 @@ FRAUD_AGENT_REGISTRY: dict[str, FraudAgent] = {
                 "emit_lead",
                 "build_user_behavioral_profile_tool",
                 "analyze_ato_risk_tool",
+                "canvas_ip_velocity_tool",
+                "knowledge_retriever",
             }
         ),
         thinking_protocol=(
@@ -325,6 +364,8 @@ FRAUD_AGENT_REGISTRY: dict[str, FraudAgent] = {
                 "emit_lead",
                 "detect_bot_clusters_tool",
                 "batch_flag_bot_cluster_tool",
+                "canvas_ip_velocity_tool",
+                "knowledge_retriever",
             }
         ),
         thinking_protocol=(
@@ -373,6 +414,8 @@ FRAUD_AGENT_REGISTRY: dict[str, FraudAgent] = {
                 "emit_lead",
                 "find_fraud_rings_tool",
                 "profile_fraud_ring_roles_tool",
+                "canvas_ip_velocity_tool",
+                "knowledge_retriever",
             }
         ),
         thinking_protocol=(
@@ -421,6 +464,46 @@ FRAUD_AGENT_REGISTRY: dict[str, FraudAgent] = {
             "schema-aware tabular reasoning until dedicated collusion tools are enabled."
         ),
         agent_type="collusion",
+    ),
+    "fraud_playbook_architect": FraudAgent(
+        id="fraud_playbook_architect",
+        display_name="Fraud Risk Architect (Playbook)",
+        system_prompt=(
+            _fraud_playbook_system_prompt()
+            + "\n\n## Voice\n"
+            "Technical, calm, and precise. You speak as a **risk architect** bridging internal-controls thinking and "
+            "data-driven detection. You never substitute invented ERP rows or Slack logs—only what the operator or tools supply."
+        ),
+        suggested_queries=(
+            "Map this dataset to the playbook’s structured observation strategy and list the top three hypotheses.",
+            "Run an overt vs covert analytic plan: what would you compute first on this CSV, and why?",
+            "Given these signals, assign Tier 1–4 with evidence-preservation notes (no fake hashes).",
+        ),
+        recommended_tools=(
+            "get_dataset_schema",
+            "execute_in_sandbox",
+            "search_historical_overlap_tool",
+            "warehouse_query_tool",
+            "warehouse_search_text_tool",
+            "find_fraud_rings_tool",
+            "profile_fraud_ring_roles_tool",
+            "chargeback_trust_velocity_tool",
+            "analyze_chargeback_risk_tool",
+            "emit_lead",
+        ),
+        allowed_tool_names=_PLAYBOOK_ARCHITECT_TOOLS,
+        thinking_protocol=(
+            "LangGraph-style flow (simulate in prose): (1) **Observe** — classify structured vs unstructured input; "
+            "note Fraud Triangle vectors. (2) **Measure** — `get_dataset_schema` then `execute_in_sandbox` for Benford, "
+            "z-scores, or cohort stats when numeric columns exist. (3) **Cross-case** — `search_historical_overlap_tool` "
+            "and warehouse reads for entity recurrence; `find_fraud_rings_tool` + `profile_fraud_ring_roles_tool` when "
+            "payment-graph columns exist. (4) **Transactional** — `chargeback_trust_velocity_tool` / "
+            "`analyze_chargeback_risk_tool` when disputes or amounts are in scope. (5) **Decide** — emit "
+            "`Recommended_Tier` 1–4 with clear thresholds; `emit_lead` only for Tier ≥2 with concrete tool-backed facts. "
+            "(6) **Ethics** — no fabricated hashes, quotes, or legal outcomes."
+        ),
+        agent_type="general",
+        confidence_threshold=0.75,
     ),
 }
 

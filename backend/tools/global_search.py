@@ -7,7 +7,11 @@ from typing import Any
 import polars as pl
 
 from backend.config import settings
+from backend.data.tenant_constants import DEFAULT_TENANT_ID
 from backend.data.warehouse import GlobalWarehouse
+from backend.data.warehouse_access import allowed_source_case_ids, tenant_id_for_case
+from backend.data.warehouse_paths import tenant_warehouse_path
+from backend.database.duckdb_lock import duckdb_lock_path
 from backend.database.models import Case
 from backend.database.session import SessionLocal
 from backend.tools.entity_columns import extract_entities_from_row
@@ -228,6 +232,8 @@ def search_historical_overlap(
     entity_type: str,
     *,
     exclude_case_id: str | None = None,
+    tenant_id: str | None = None,
+    viewer_case_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Look up ``entity_id`` in the warehouse ``entity_map`` (user_id / ip_address / device_id / card_hash).
@@ -240,7 +246,17 @@ def search_historical_overlap(
     if not eid or not et:
         return {"ok": False, "error": "entity_id and valid entity_type (user_id|ip_address|device_id|card_hash) required."}
 
-    wh_path = Path(settings.global_warehouse_db_path)
+    db_acl = SessionLocal()
+    try:
+        tid = (tenant_id or "").strip() or (
+            tenant_id_for_case(db_acl, exclude_case_id) if exclude_case_id else DEFAULT_TENANT_ID
+        )
+        viewer = viewer_case_id if viewer_case_id is not None else exclude_case_id
+        allowed = allowed_source_case_ids(db_acl, tenant_id=tid, viewer_case_id=viewer)
+    finally:
+        db_acl.close()
+
+    wh_path = Path(tenant_warehouse_path(settings.data_dir, tid))
     if not wh_path.is_file():
         return {
             "ok": True,
@@ -256,91 +272,94 @@ def search_historical_overlap(
             "kind": "cross_case_matches",
         }
 
-    gw = GlobalWarehouse(wh_path)
-    con = gw._connect()
-    try:
-        gw.ensure_schema(con)
-        cur = con.execute(
-            """
-            SELECT distinct_case_count, first_seen, last_seen, case_ids
-            FROM entity_map
-            WHERE entity_type = ? AND entity_value = ?
-            LIMIT 1;
-            """,
-            [et, eid],
-        )
-        row = cur.fetchone()
-        if not row:
-            return {
+    gw = GlobalWarehouse(db_path=wh_path)
+    with duckdb_lock_path(wh_path):
+        con = gw._connect()
+        try:
+            gw.ensure_schema(con)
+            cur = con.execute(
+                """
+                SELECT distinct_case_count, first_seen, last_seen, case_ids
+                FROM entity_map
+                WHERE entity_type = ? AND entity_value = ?
+                LIMIT 1;
+                """,
+                [et, eid],
+            )
+            row = cur.fetchone()
+            if not row:
+                return {
+                    "ok": True,
+                    "entity_id": eid,
+                    "entity_type": et,
+                    "distinct_case_count": 0,
+                    "other_case_count_excluding_active": 0,
+                    "other_cases": [],
+                    "recidivist_fraudster": False,
+                    "priority": "Normal",
+                    "note": "No historical rows indexed for this entity.",
+                    "global_hits": False,
+                    "kind": "cross_case_matches",
+                }
+
+            first_seen = row[1]
+            last_seen = row[2]
+            case_ids_raw = row[3]
+            if case_ids_raw is None:
+                case_ids: list[str] = []
+            elif isinstance(case_ids_raw, list):
+                case_ids = [str(x) for x in case_ids_raw]
+            else:
+                case_ids = [str(case_ids_raw)]
+
+            case_ids = [c for c in case_ids if c in allowed]
+            distinct_total = len(set(case_ids))
+
+            ex = (exclude_case_id or "").strip()
+            other_ids = [c for c in case_ids if c != ex]
+            other_distinct = len(set(other_ids))
+            recidivist = other_distinct > 2
+            priority = "Recidivist Fraudster" if recidivist else ("Elevated" if other_distinct > 0 else "Normal")
+
+            ids_for_meta = list(set(case_ids))
+            if ex and ex not in ids_for_meta:
+                ids_for_meta.append(ex)
+            meta = _case_meta(ids_for_meta)
+            other_cases: list[dict[str, Any]] = []
+            for oc_id in sorted(set(other_ids), key=lambda x: (meta.get(x) or {}).get("created_at") or ""):
+                m = meta.get(oc_id) or {"case_id": oc_id, "case_name": oc_id, "status": "UNKNOWN", "result_label": "Unknown"}
+                other_cases.append(
+                    {
+                        **m,
+                        "first_seen_in_warehouse": first_seen.isoformat() if hasattr(first_seen, "isoformat") else str(first_seen),
+                        "last_seen_in_warehouse": last_seen.isoformat() if hasattr(last_seen, "isoformat") else str(last_seen),
+                    }
+                )
+
+            out: dict[str, Any] = {
                 "ok": True,
                 "entity_id": eid,
                 "entity_type": et,
-                "distinct_case_count": 0,
-                "other_case_count_excluding_active": 0,
-                "other_cases": [],
-                "recidivist_fraudster": False,
-                "priority": "Normal",
-                "note": "No historical rows indexed for this entity.",
-                "global_hits": False,
+                "distinct_case_count": distinct_total,
+                "other_case_count_excluding_active": other_distinct,
+                "other_cases": other_cases,
+                "recidivist_fraudster": recidivist,
+                "priority": priority,
+                "global_hits": bool(other_distinct > 0),
                 "kind": "cross_case_matches",
             }
-
-        distinct_total = int(row[0])
-        first_seen = row[1]
-        last_seen = row[2]
-        case_ids_raw = row[3]
-        if case_ids_raw is None:
-            case_ids: list[str] = []
-        elif isinstance(case_ids_raw, list):
-            case_ids = [str(x) for x in case_ids_raw]
-        else:
-            case_ids = [str(case_ids_raw)]
-
-        ex = (exclude_case_id or "").strip()
-        other_ids = [c for c in case_ids if c != ex]
-        other_distinct = len(set(other_ids))
-        recidivist = other_distinct > 2
-        priority = "Recidivist Fraudster" if recidivist else ("Elevated" if other_distinct > 0 else "Normal")
-
-        ids_for_meta = list(set(case_ids))
-        if ex and ex not in ids_for_meta:
-            ids_for_meta.append(ex)
-        meta = _case_meta(ids_for_meta)
-        other_cases: list[dict[str, Any]] = []
-        for cid in sorted(set(other_ids), key=lambda x: (meta.get(x) or {}).get("created_at") or ""):
-            m = meta.get(cid) or {"case_id": cid, "case_name": cid, "status": "UNKNOWN", "result_label": "Unknown"}
-            other_cases.append(
-                {
-                    **m,
-                    "first_seen_in_warehouse": first_seen.isoformat() if hasattr(first_seen, "isoformat") else str(first_seen),
-                    "last_seen_in_warehouse": last_seen.isoformat() if hasattr(last_seen, "isoformat") else str(last_seen),
-                }
-            )
-
-        out: dict[str, Any] = {
-            "ok": True,
-            "entity_id": eid,
-            "entity_type": et,
-            "distinct_case_count": distinct_total,
-            "other_case_count_excluding_active": other_distinct,
-            "other_cases": other_cases,
-            "recidivist_fraudster": recidivist,
-            "priority": priority,
-            "global_hits": bool(other_distinct > 0),
-            "kind": "cross_case_matches",
-        }
-        if other_distinct > 0:
-            out["global_linkage"] = _build_global_linkage(
-                entity_id=eid,
-                entity_type=et,
-                exclude_case_id=ex,
-                other_cases=other_cases,
-                active_meta=meta.get(ex) or {},
-            )
-            out["global_intelligence_match"] = True
-        return out
-    finally:
-        con.close()
+            if other_distinct > 0:
+                out["global_linkage"] = _build_global_linkage(
+                    entity_id=eid,
+                    entity_type=et,
+                    exclude_case_id=ex,
+                    other_cases=other_cases,
+                    active_meta=meta.get(ex) or {},
+                )
+                out["global_intelligence_match"] = True
+            return out
+        finally:
+            con.close()
 
 
 def sample_entities_from_case_csv(dataset_path: str | Path, *, max_scan_rows: int = 80) -> dict[str, str]:

@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, model_validator
+
+from backend.data.tenant_constants import DEFAULT_TENANT_ID
+from backend.data.warehouse_paths import tenant_warehouse_path as _tenant_warehouse_path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +28,30 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3.2"
     ollama_api_key: str = "ollama"
     debug_agent: bool = False
+    llm_tool_confidence: bool = Field(
+        default=False,
+        description="If True, use LLM structured output for per-tool confidence (RFI). If False, use fast deterministic heuristics.",
+    )
+    ingestion_provider: Literal["local", "tarka", "auto"] = Field(
+        default="local",
+        description="local: Polars/DuckDB only. tarka: require Tarka HTTP ingest. auto: try Tarka when tarka_etl_base_url is set, else local.",
+    )
+    tarka_etl_base_url: str = Field(
+        default="",
+        description="Base URL for Tarka ETL (POST {base}/ingest multipart).",
+    )
+    sandbox_mode: Literal["subprocess", "docker", "pyodide"] = Field(
+        default="pyodide",
+        description="subprocess: AST-validated local Python. docker: isolate in container. pyodide: WASM sandbox via Node.js.",
+    )
+    sandbox_docker_image: str = Field(
+        default="python:3.12-slim",
+        description="Image for sandbox_mode=docker (must include Python + deps you need, e.g. a custom image with polars).",
+    )
+    sandbox_docker_r_image: str = Field(
+        default="rocker/r-ver:4.4.0",
+        description="Image for R when sandbox_mode=docker.",
+    )
     duckdb_threads: int | None = None
     duckdb_memory_limit: str | None = Field(
         default=None,
@@ -61,12 +89,14 @@ class Settings(BaseSettings):
         p.mkdir(parents=True, exist_ok=True)
         return p
 
+    def tenant_warehouse_db_path(self, tenant_id: str | None = None) -> Path:
+        """Per-tenant DuckDB warehouse (isolated from other tenants)."""
+        return _tenant_warehouse_path(self.data_dir, tenant_id or DEFAULT_TENANT_ID)
+
     @property
     def global_warehouse_db_path(self) -> Path:
-        """Single DuckDB file aggregating all case CSV rows for cross-case analytics."""
-        p = self.data_dir / "warehouse" / "global.duckdb"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        return p
+        """Default-tenant warehouse path (backward compatible with single-tenant installs)."""
+        return self.tenant_warehouse_db_path(DEFAULT_TENANT_ID)
 
 
 settings = Settings()

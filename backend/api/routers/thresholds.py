@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
+from backend.database.dataset_path_resolve import resolve_with_active_fallback
 from backend.database.models import Case
 from backend.schemas import OptimizeThresholdsRequest, OptimizeThresholdsResponse
 from backend.tools.optimize_thresholds import run_optimize
@@ -17,14 +18,10 @@ def optimize_thresholds(body: OptimizeThresholdsRequest, db: Session = Depends(g
     path = body.dataset_path
     if not path and body.case_id:
         c = db.query(Case).filter(Case.id == body.case_id).first()
-        if not c or not c.dataset_path:
-            raise HTTPException(400, "Case has no dataset_path")
-        path = c.dataset_path
+        path = c.dataset_path if c else None
+    path = resolve_with_active_fallback(db, path)
     if not path:
-        active = db.query(Case).filter(Case.is_active.is_(True)).first()
-        if not active or not active.dataset_path:
-            raise HTTPException(400, "No dataset path provided")
-        path = active.dataset_path
+        raise HTTPException(400, "No dataset path provided (case CSV missing and no active case CSV).")
     result = run_optimize(path, body.model, body.target_column, body.optimization_objective)
     if body.case_id:
         c = db.query(Case).filter(Case.id == body.case_id).first()

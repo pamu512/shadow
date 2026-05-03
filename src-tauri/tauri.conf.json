@@ -5,8 +5,8 @@
   "identifier": "com.shadow.forensics",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev:tauri",
     "beforeBuildCommand": "npm run build"
   },
   "app": {

@@ -1,5 +1,7 @@
+import { useQuery } from '@tanstack/react-query'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { RotateCcw } from 'lucide-react'
+import { toast } from 'sonner'
 import { isRfiMessageContent, LeadInvestigatorRFI } from './LeadInvestigatorRFI'
 import {
   AGENT_INJECT_EVENT,
@@ -9,6 +11,7 @@ import {
   sendChat,
   type AgentInjectDetail,
 } from '../../lib/api'
+import { useShadowStore } from '../../stores/shadowStore'
 import type { CaseOut, ChatMessage, PersonaListItem } from '../../lib/types'
 import { GhostButton } from '../ui/ForensicChrome'
 import { ForensicModal } from '../ui/ForensicModal'
@@ -22,7 +25,8 @@ import {
   parseToolMessageContent,
   ToolExecutionBlock,
 } from './ToolExecutionBlock'
-import { ForensicResultTranscriptCard, type PinnedForensicPayload } from './ForensicResultTranscriptCard'
+import { ForensicResultTranscriptCard } from './ForensicResultTranscriptCard'
+import type { PinnedForensicPayload } from '../../lib/types'
 import { parseForensicTranscriptJson } from './parseForensicTranscriptJson'
 import { renderTextWithEntityChips } from './EntityChip'
 import { isHallucinatedAgentToolSnippet } from './agentToolSnippetGuard'
@@ -90,7 +94,18 @@ const WAREHOUSE_SQL_SNIPPETS = [
 
 export function AgentConsole({ activeCase, onReviewResult, onPersonaChange, onPinForensic }: Props) {
   const [personaId, setPersonaId] = useState('general')
-  const [personas, setPersonas] = useState<PersonaListItem[]>([])
+  
+  const { data: personas = [] } = useQuery({
+    queryKey: ['personas'],
+    queryFn: async () => {
+      try {
+        return await fetchPersonas()
+      } catch {
+        return []
+      }
+    },
+    staleTime: 5 * 60 * 1000,
+  })
   const [lines, setLines] = useState<LineEntry[]>([
     {
       role: 'assistant',
@@ -116,14 +131,9 @@ export function AgentConsole({ activeCase, onReviewResult, onPersonaChange, onPi
   const prevPersonaIdRef = useRef<string | null>(null)
   const prevCaseIdRef = useRef<string | null | undefined>(undefined)
   const pendingThreadResetRef = useRef(false)
+  const rotateChatThread = useShadowStore((s) => s.rotateChatThread)
 
   const activePersona = personas.find((p) => p.id === personaId) ?? null
-
-  useEffect(() => {
-    void fetchPersonas()
-      .then(setPersonas)
-      .catch(() => setPersonas([]))
-  }, [])
 
   useEffect(() => {
     if (!activeCase?.id) {
@@ -164,9 +174,10 @@ export function AgentConsole({ activeCase, onReviewResult, onPersonaChange, onPi
     }
     if (prevPersonaIdRef.current === personaId) return
     prevPersonaIdRef.current = personaId
+    rotateChatThread()
     setLines([{ role: 'assistant', content: welcomeText(personaId, personas), at: Date.now() }])
     pendingThreadResetRef.current = true
-  }, [personaId, personas])
+  }, [personaId, personas, rotateChatThread])
 
   /** New thread when the active case changes (including null ↔ case). */
   useEffect(() => {
@@ -177,14 +188,16 @@ export function AgentConsole({ activeCase, onReviewResult, onPersonaChange, onPi
     }
     if (prevCaseIdRef.current === cid) return
     prevCaseIdRef.current = cid
+    rotateChatThread()
     setLines([{ role: 'assistant', content: welcomeText(personaId, personas), at: Date.now() }])
     pendingThreadResetRef.current = true
-  }, [activeCase?.id, personaId, personas])
+  }, [activeCase?.id, personaId, personas, rotateChatThread])
 
   const resetChatToWelcome = useCallback(() => {
+    rotateChatThread()
     setLines([{ role: 'assistant', content: welcomeText(personaId, personas), at: Date.now() }])
     pendingThreadResetRef.current = true
-  }, [personaId, personas])
+  }, [personaId, personas, rotateChatThread])
 
   const pushAssistant = useCallback((text: string) => {
     setLines((p) => [...p, { role: 'assistant', content: text, at: Date.now() }])
@@ -249,14 +262,17 @@ export function AgentConsole({ activeCase, onReviewResult, onPersonaChange, onPi
       try {
         const threadReset = pendingThreadResetRef.current
         pendingThreadResetRef.current = false
-        const res = await sendChat(nextChat, activeCase?.id, effectivePersona, threadReset)
+        const threadId = useShadowStore.getState().chatThreadId
+        const res = await sendChat(nextChat, activeCase?.id, effectivePersona, threadReset, threadId)
         setLines((prev) => attachTimes(prev, res.messages))
       } catch (e) {
+        const errStr = e instanceof Error ? e.message : String(e)
+        toast.error('Chat failed', { description: errStr })
         setLines((p) => [
           ...p,
           {
             role: 'assistant',
-            content: `ERR ${e instanceof Error ? e.message : String(e)}`,
+            content: `ERR ${errStr}`,
             at: Date.now(),
           },
         ])

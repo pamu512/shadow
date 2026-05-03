@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
-from pydantic import BaseModel, Field
+from threading import Lock
 
+from .checkpointing import get_langgraph_checkpointer
 from .coordinator import (
     build_analyst_system_prompt,
     build_code_agent_prompt,
@@ -17,23 +18,9 @@ from .coordinator import (
 from .ollama import get_llm
 from .personas import get_persona
 from .reasoning_hooks import context_injection_node
+from .supervisor_routing import invoke_supervisor_route
 from .state import AgentState
 from .tools_langchain import build_analyst_tools, build_code_tools, build_ml_tools
-
-
-class SupervisorRoute(BaseModel):
-    next_agent: Literal["code_agent", "ml_agent", "analyst"] = Field(
-        description="Which specialist should answer the user request"
-    )
-
-
-def _fallback_route(text: str) -> Literal["code_agent", "ml_agent", "analyst"]:
-    t = text.lower()
-    if any(k in t for k in ("threshold", "model", "train", "isolation", "forest", "fraud score")):
-        return "ml_agent"
-    if any(k in t for k in ("polars", "rscript", "data.table", "review code", "python", "execute")):
-        return "code_agent"
-    return "analyst"
 
 
 def _make_supervisor_node(supervisor_prompt: str):
@@ -45,17 +32,7 @@ def _make_supervisor_node(supervisor_prompt: str):
             if isinstance(m, HumanMessage):
                 last_user = str(m.content)
                 break
-        try:
-            structured = llm.with_structured_output(SupervisorRoute)
-            decision = structured.invoke(
-                [
-                    SystemMessage(content=supervisor_prompt),
-                    HumanMessage(content=last_user or "Hello"),
-                ]
-            )
-            nxt = decision.next_agent
-        except Exception:  # noqa: BLE001
-            nxt = _fallback_route(last_user)
+        nxt = invoke_supervisor_route(llm, supervisor_prompt=supervisor_prompt, last_user=last_user)
         return {"next_agent": nxt}
 
     return supervisor_node
@@ -118,24 +95,29 @@ def build_graph(persona_id: str):
     g.add_edge("code_agent", END)
     g.add_edge("ml_agent", END)
     g.add_edge("analyst", END)
-    return g.compile()
+    return g.compile(checkpointer=get_langgraph_checkpointer())
 
 
+# Per-persona compiled graph templates (prompts/tools frozen at compile time).
+# Thread-safe via lock; **conversation state** lives in SqliteSaver (see checkpointing.py), not here.
 _compiled: dict[str, object] = {}
+_compile_lock = Lock()
 
 
 def invalidate_compiled_graph_cache(persona_id: str | None = None) -> None:
     """Drop cached compiled graphs so prompts/tools reload (e.g. after persona switch)."""
     global _compiled
-    if persona_id:
-        _compiled.pop(persona_id.strip(), None)
-    else:
-        _compiled.clear()
+    with _compile_lock:
+        if persona_id:
+            _compiled.pop(persona_id.strip(), None)
+        else:
+            _compiled.clear()
 
 
 def get_compiled_graph(persona_id: str):
     """Return compiled graph for this persona (separate prompts per lens)."""
     global _compiled
-    if persona_id not in _compiled:
-        _compiled[persona_id] = build_graph(persona_id)
-    return _compiled[persona_id]
+    with _compile_lock:
+        if persona_id not in _compiled:
+            _compiled[persona_id] = build_graph(persona_id)
+        return _compiled[persona_id]

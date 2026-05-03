@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from backend.config import settings
 from backend.database import get_db
+from backend.database.dataset_path_resolve import resolve_with_active_fallback
 from backend.database.models import Case
 from backend.schemas import ExecuteRequest, ExecuteResponse
 from backend.tools.audit_log import record_audit
@@ -27,6 +28,7 @@ def run_code(body: ExecuteRequest, db: Session = Depends(get_db)) -> ExecuteResp
     else:
         a = db.query(Case).filter(Case.is_active.is_(True)).first()
         ds_path = a.dataset_path if a else None
+    ds_path = resolve_with_active_fallback(db, ds_path)
     if ds_path:
         os.environ["FRAUD_DATASET_PATH"] = str(Path(ds_path).resolve())
     out = execute_code(body.language, body.code, timeout_sec=body.timeout_sec)

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
+from backend.database.dataset_path_resolve import resolve_with_active_fallback
 from backend.database.models import Case
 from backend.tools.network_analyzer import export_fraud_ring_network, find_fraud_rings
 
@@ -42,10 +43,11 @@ def post_network_rings(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     case = _get_case(case_id, db)
-    if not case.dataset_path:
+    path = resolve_with_active_fallback(db, case.dataset_path)
+    if not path:
         raise HTTPException(status_code=400, detail="Case has no dataset_path; upload a CSV first.")
     return find_fraud_rings(
-        case.dataset_path,
+        path,
         account_column=body.account_column,
         payer_column=body.payer_column,
         payee_column=body.payee_column,
@@ -60,11 +62,12 @@ def post_network_export(
     db: Session = Depends(get_db),
 ) -> Response:
     case = _get_case(case_id, db)
-    if not case.dataset_path:
+    path = resolve_with_active_fallback(db, case.dataset_path)
+    if not path:
         raise HTTPException(status_code=400, detail="Case has no dataset_path; upload a CSV first.")
     try:
         data, ext = export_fraud_ring_network(
-            case.dataset_path,
+            path,
             body.export_format,
             account_column=body.account_column,
             payer_column=body.payer_column,

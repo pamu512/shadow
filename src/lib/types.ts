@@ -1,5 +1,14 @@
 export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string }
 
+/** Pinned forensic card in workspace (server-persisted per case). */
+export type PinnedForensicPayload = {
+  id: string
+  title: string
+  subtitle: string
+  payload: Record<string, unknown>
+  pinnedAt: number
+}
+
 export type PersonaSuggestion = {
   persona_id: string
   display_name: string
@@ -32,6 +41,7 @@ export type CasesPurgeOut = { ok: boolean; cases_removed: number }
 
 export type CaseOut = {
   id: string
+  tenant_id?: string
   name: string
   dataset_path: string | null
   duckdb_path?: string | null

@@ -99,6 +99,18 @@ _PERSONA_DETECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
         "marketplace",
         "merchant_id",
     ),
+    "fraud_playbook_architect": (
+        "journal_entry",
+        "general_ledger",
+        "vendor_master",
+        "purchase_order",
+        "invoice_amount",
+        "segregation",
+        "esg",
+        "sustainability_metric",
+        "expense_report",
+        "te_report",
+    ),
 }
 
 
@@ -141,10 +153,23 @@ def resolve_persona_id(persona_id: str | None) -> str:
 
 def analyst_react_instructions() -> str:
     return (
-        "You are a fraud analytics analyst. Be concise. "
-        "When you identify actionable fraud hypotheses, call emit_lead with a severity score, "
-        "clear description, and a JSON raw_data_snippet string. "
-        "Use get_dataset_schema when you need column context."
+        "You are a fraud analytics analyst. Be concise.\n\n"
+        "## Tooling discipline (critical)\n"
+        "- Tools are invoked **only** by this runtime (LangGraph ReAct). **Never** type or paste lines of JSON that "
+        "look like tool invocations, e.g. `{\"name\": \"some_tool\", \"parameters\": {...}}`—operators cannot run "
+        "those, and they are **wrong**.\n"
+        "- If the user asks for **planning**, **priorities**, **hypotheses to test first**, methodology, or definitions "
+        "**without** asking you to query their case file or warehouse, answer in **plain English** (numbered lists "
+        "welcome). **Do not** call warehouse, overlap, schema, or sandbox tools for that—no invented “search results.” "
+        "**Do not** invent placeholder entities like `<active case device_id>` or example dollar amounts as if they "
+        "were real evidence.\n"
+        "- Never paste bracketed runtime hints (lines starting with `[Mandatory`, `[Global warehouse`, "
+        "`[Context injection`)—the operator does not see those; repeating them is incorrect.\n"
+        "- When you **do** need evidence, call the actual tools (the UI will show `[tool …]` results); then interpret "
+        "that output in prose.\n\n"
+        "When you identify actionable fraud hypotheses **backed by tool output**, you may call **emit_lead** with a "
+        "severity score, clear description, and a JSON **raw_data_snippet** string. "
+        "Use **get_dataset_schema** when column roles are unclear for a data pull."
     )
 
 

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from backend.agent.ollama import get_llm
 from backend.database import get_db
+from backend.database.dataset_path_resolve import resolve_with_active_fallback
 from backend.database.models import Case
 from backend.schemas import CodeReviewRequest, CodeReviewResponse
 from backend.tools.code_review_lib import review_script
@@ -23,5 +24,6 @@ def code_review(body: CodeReviewRequest, db: Session = Depends(get_db)) -> CodeR
     else:
         a = db.query(Case).filter(Case.is_active.is_(True)).first()
         ds = a.dataset_path if a else None
+    ds = resolve_with_active_fallback(db, ds)
     orig, sug, notes = review_script(body.script, body.language, ds, llm=get_llm())
     return CodeReviewResponse(original=orig, suggested=sug, notes=notes)
