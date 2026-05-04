@@ -6,7 +6,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import uuid
 from pathlib import Path
 
@@ -58,23 +57,19 @@ def run_python_subprocess(
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
         
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".py",
-        delete=False,
-        encoding="utf-8",
-        dir=settings.workspace_dir,
-    ) as tmp:
-        tmp.write(script_body)
-        script_path = Path(tmp.name)
-        
+    cwd_dir = settings.workspace_dir / f"cwd_{uuid.uuid4().hex}"
+    cwd_dir.mkdir(parents=True, exist_ok=True)
+    script_path = cwd_dir / f"run_{uuid.uuid4().hex}.py"
+    script_path.write_text(script_body, encoding="utf-8")
+
     try:
         if use_pyodide:
             from backend.sandbox.pyodide_runner import run_python_in_pyodide
+
             rc, out, err = run_python_in_pyodide(
                 script_path,
                 timeout_sec=timeout_sec,
-                workspace=settings.workspace_dir,
+                workspace=cwd_dir,
                 dataset_path=env.get("FRAUD_DATASET_PATH", ""),
             )
         else:
@@ -83,20 +78,17 @@ def run_python_subprocess(
                 capture_output=True,
                 text=True,
                 timeout=timeout_sec,
-                cwd=str(settings.workspace_dir),
+                cwd=str(cwd_dir),
                 env=env,
             )
             rc, out, err = proc.returncode, proc.stdout or "", proc.stderr or ""
-            
+
         plots = [base64.b64encode(png.read_bytes()).decode("ascii") for png in sorted(out_dir.glob("*.png"))]
         violations: list[str] = []
         return rc, out, err, plots, violations
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
-        try:
-            script_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        shutil.rmtree(cwd_dir, ignore_errors=True)
 
 
 def run_rscript(

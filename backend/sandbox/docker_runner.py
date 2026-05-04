@@ -12,9 +12,47 @@ from pathlib import Path
 
 from backend.config import settings
 
+_storage_opt_supported: bool | None = None
+
 
 def _docker_available() -> bool:
     return shutil.which("docker") is not None
+
+
+def _supports_storage_opt() -> bool:
+    """Return whether the local Docker daemon accepts ``--storage-opt size=…`` (overlay2 + xfs, etc.)."""
+    global _storage_opt_supported
+    if _storage_opt_supported is not None:
+        return _storage_opt_supported
+    if not _docker_available():
+        _storage_opt_supported = False
+        return False
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--storage-opt",
+                "size=10M",
+                "alpine",
+                "echo",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        _storage_opt_supported = proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        _storage_opt_supported = False
+    return _storage_opt_supported
+
+
+def _storage_opt_args() -> list[str]:
+    if _supports_storage_opt():
+        return ["--storage-opt", "size=1G"]
+    return []
 
 
 def _dataset_volume_args(env: dict[str, str]) -> tuple[list[str], dict[str, str]]:
@@ -63,8 +101,7 @@ def run_python_in_docker(
             "768m",
             "--cpus",
             "1.0",
-            "--storage-opt",
-            "size=1G",
+            *_storage_opt_args(),
             "--pids-limit",
             "100",
             "--ulimit",
@@ -131,8 +168,7 @@ def run_r_in_docker(
             "768m",
             "--cpus",
             "1.0",
-            "--storage-opt",
-            "size=1G",
+            *_storage_opt_args(),
             "--pids-limit",
             "100",
             "--ulimit",

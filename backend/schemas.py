@@ -93,6 +93,21 @@ class CasePatch(BaseModel):
         return self
 
 
+class CaseShareCreate(BaseModel):
+    """Grant ``viewer_case_id`` read access to this case's rows in the tenant warehouse."""
+
+    viewer_case_id: str = Field(..., min_length=1, max_length=64)
+
+
+class CaseShareOut(BaseModel):
+    id: int
+    owner_case_id: str
+    viewer_case_id: str
+
+    class Config:
+        from_attributes = True
+
+
 class CaseOut(BaseModel):
     id: str
     tenant_id: str = "default"

@@ -10,8 +10,10 @@ from pathlib import Path
 
 import polars as pl
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy import case, func
-from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from sqlalchemy import case as sql_case, func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.agent.coordinator import build_persona_suggestion
 from backend.case_status import normalize_case_status
@@ -19,9 +21,9 @@ from backend.config import settings
 from backend.data.tenant_constants import DEFAULT_TENANT_ID
 from backend.data.warehouse import GlobalWarehouse
 from backend.database import get_db
+from backend.database.dataset_path_resolve import resolve_with_active_fallback_async
 from backend.database.ingestion_pipeline import ingest_csv_with_fallback
-from backend.database.dataset_path_resolve import resolve_with_active_fallback
-from backend.database.models import AuditLog, Case, CaseWorkbenchPins, Lead
+from backend.database.models import AuditLog, Case, CaseShare, CaseWorkbenchPins, Lead
 from backend.schemas import (
     ActivityBulkRequest,
     ActivityBulkResponse,
@@ -29,6 +31,8 @@ from backend.schemas import (
     CaseCreate,
     CaseOut,
     CasePatch,
+    CaseShareCreate,
+    CaseShareOut,
     CasesPurgeOut,
     EvidenceBoardResponse,
     LeadOut,
@@ -37,7 +41,18 @@ from backend.schemas import (
     WorkbenchPinsOut,
     WorkbenchPinsPut,
 )
-from pydantic import BaseModel
+from backend.tools.case_activity import compute_case_activity
+
+router = APIRouter(prefix="/api/cases", tags=["cases"])
+_log = logging.getLogger(__name__)
+
+_STATUS_SORT = sql_case(
+    (Case.status == "FLAGGED", 0),
+    (Case.status == "INVESTIGATING", 1),
+    (Case.status == "CLEARED", 2),
+    else_=3,
+)
+
 
 class SnowflakeIngestRequest(BaseModel):
     name: str
@@ -50,6 +65,7 @@ class SnowflakeIngestRequest(BaseModel):
     schema_name: str
     query: str
 
+
 class BigQueryIngestRequest(BaseModel):
     name: str
     status: str = "INVESTIGATING"
@@ -57,55 +73,41 @@ class BigQueryIngestRequest(BaseModel):
     credentials_json: str
     query: str
 
-from backend.tools.case_activity import compute_case_activity
 
-router = APIRouter(prefix="/api/cases", tags=["cases"])
-_log = logging.getLogger(__name__)
-
-_STATUS_SORT = case(
-    (Case.status == "FLAGGED", 0),
-    (Case.status == "INVESTIGATING", 1),
-    (Case.status == "CLEARED", 2),
-    else_=3,
-)
-
-
-def _memory_aggregates(
-    db: Session, ids: list[str]
+async def _memory_aggregates(
+    db: AsyncSession, ids: list[str]
 ) -> tuple[dict[str, int], dict[str, tuple[int, datetime | None, int]]]:
     if not ids:
         return {}, {}
-    lead_counts = dict(
-        db.query(Lead.case_id, func.count(Lead.id))
-        .filter(Lead.case_id.in_(ids))
-        .group_by(Lead.case_id)
-        .all()
+    lead_result = await db.execute(
+        select(Lead.case_id, func.count(Lead.id)).where(Lead.case_id.in_(ids)).group_by(Lead.case_id)
     )
-    aud_rows = (
-        db.query(
+    lead_counts = {str(row[0]): int(row[1]) for row in lead_result.all()}
+    aud_result = await db.execute(
+        select(
             AuditLog.case_id,
             func.count(AuditLog.id).label("ev"),
             func.max(AuditLog.timestamp).label("last_ts"),
-            func.sum(case((AuditLog.code_executed.isnot(None), 1), else_=0)).label("scripts"),
+            func.sum(sql_case((AuditLog.code_executed.isnot(None), 1), else_=0)).label("scripts"),
         )
-        .filter(AuditLog.case_id.in_(ids))
+        .where(AuditLog.case_id.in_(ids))
         .group_by(AuditLog.case_id)
-        .all()
     )
     aud: dict[str, tuple[int, datetime | None, int]] = {}
-    for r in aud_rows:
-        scripts_val = getattr(r, "scripts", None)
-        ts = r.last_ts
-        aud[r.case_id] = (
-            int(r.ev or 0),
+    for r in aud_result.mappings().all():
+        scripts_val = r.get("scripts")
+        ts = r.get("last_ts")
+        cid_key = str(r["case_id"])
+        aud[cid_key] = (
+            int(r["ev"] or 0),
             ts if isinstance(ts, datetime) else None,
             int(scripts_val or 0),
         )
     return lead_counts, aud
 
 
-def _case_to_out(db: Session, row: Case) -> CaseOut:
-    lc, aud = _memory_aggregates(db, [row.id])
+async def _case_to_out(db: AsyncSession, row: Case) -> CaseOut:
+    lc, aud = await _memory_aggregates(db, [row.id])
     n_lead = lc.get(row.id, 0)
     ev, last_ts, n_script = aud.get(row.id, (0, None, 0))
     return CaseOut(
@@ -128,20 +130,21 @@ def _case_to_out(db: Session, row: Case) -> CaseOut:
 
 
 @router.get("", response_model=list[CaseOut])
-def list_cases(db: Session = Depends(get_db)) -> list[CaseOut]:
-    cases = db.query(Case).order_by(_STATUS_SORT.asc(), Case.created_at.desc()).all()
+async def list_cases(db: AsyncSession = Depends(get_db)) -> list[CaseOut]:
+    result = await db.execute(select(Case).order_by(_STATUS_SORT.asc(), Case.created_at.desc()))
+    cases = result.scalars().all()
     if not cases:
         return []
-    return [_case_to_out(db, c) for c in cases]
+    return [await _case_to_out(db, c) for c in cases]
 
 
 @router.post("/ingest/snowflake", response_model=CaseOut)
-def ingest_snowflake(body: SnowflakeIngestRequest, db: Session = Depends(get_db)) -> CaseOut:
+async def ingest_snowflake(body: SnowflakeIngestRequest, db: AsyncSession = Depends(get_db)) -> CaseOut:
     try:
         import snowflake.connector
     except ImportError:
         raise HTTPException(500, "snowflake-connector-python not installed")
-        
+
     try:
         conn = snowflake.connector.connect(
             user=body.user,
@@ -149,18 +152,18 @@ def ingest_snowflake(body: SnowflakeIngestRequest, db: Session = Depends(get_db)
             account=body.account,
             warehouse=body.warehouse,
             database=body.database,
-            schema=body.schema_name
+            schema=body.schema_name,
         )
         cur = conn.cursor()
         cur.execute(body.query)
         df = cur.fetch_pandas_all()
         conn.close()
     except Exception as e:
-        raise HTTPException(400, f"Snowflake query failed: {e}")
-        
+        raise HTTPException(400, f"Snowflake query failed: {e}") from e
+
     if df.empty:
         raise HTTPException(400, "Query returned no rows")
-        
+
     cid = str(uuid.uuid4())
     filename = f"{cid}_snowflake.parquet"
     out_path = settings.datasets_storage_dir / filename
@@ -189,37 +192,38 @@ def ingest_snowflake(body: SnowflakeIngestRequest, db: Session = Depends(get_db)
         status=normalize_case_status(body.status),
     )
     db.add(case)
-    db.commit()
-    db.refresh(case)
-    return _case_to_out(db, case)
+    await db.commit()
+    await db.refresh(case)
+    return await _case_to_out(db, case)
 
 
 @router.post("/ingest/bigquery", response_model=CaseOut)
-def ingest_bigquery(body: BigQueryIngestRequest, db: Session = Depends(get_db)) -> CaseOut:
+async def ingest_bigquery(body: BigQueryIngestRequest, db: AsyncSession = Depends(get_db)) -> CaseOut:
     try:
         from google.cloud import bigquery
         from google.oauth2 import service_account
     except ImportError:
         raise HTTPException(500, "google-cloud-bigquery not installed")
-        
+
     try:
         import json
+
         creds_info = json.loads(body.credentials_json)
         credentials = service_account.Credentials.from_service_account_info(creds_info)
         client = bigquery.Client(credentials=credentials, project=body.project_id)
-        
+
         query_job = client.query(body.query)
         df = query_job.to_dataframe()
     except Exception as e:
-        raise HTTPException(400, f"BigQuery query failed: {e}")
-        
+        raise HTTPException(400, f"BigQuery query failed: {e}") from e
+
     if df.empty:
         raise HTTPException(400, "Query returned no rows")
-        
+
     cid = str(uuid.uuid4())
     filename = f"{cid}_bigquery.parquet"
     out_path = settings.datasets_storage_dir / filename
-    
+
     pldf = pl.from_pandas(df)
     pldf.write_parquet(str(out_path))
     tmp_csv = out_path.with_suffix(".csv")
@@ -244,17 +248,17 @@ def ingest_bigquery(body: BigQueryIngestRequest, db: Session = Depends(get_db)) 
         status=normalize_case_status(body.status),
     )
     db.add(case)
-    db.commit()
-    db.refresh(case)
-    return _case_to_out(db, case)
+    await db.commit()
+    await db.refresh(case)
+    return await _case_to_out(db, case)
 
 
 @router.post("/upload", response_model=CaseOut)
-def upload_case(
+async def upload_case(
     name: str = Form(...),
     status: str = Form(default="INVESTIGATING"),
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> CaseOut:
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(400, "A .csv file is required")
@@ -277,7 +281,6 @@ def upload_case(
     try:
         GlobalWarehouse(tenant_id=tenant_id).append_case_csv(case_id, dest_csv, file.filename)
     except Exception as wh_exc:  # noqa: BLE001
-        # Case DuckDB is authoritative; warehouse is additive — log-only failure for MVP.
         _log.warning("Global warehouse append failed for %s: %s", case_id, wh_exc)
 
     case = Case(
@@ -291,13 +294,13 @@ def upload_case(
         schema_summary=summary,
     )
     db.add(case)
-    db.commit()
-    db.refresh(case)
-    return _case_to_out(db, case)
+    await db.commit()
+    await db.refresh(case)
+    return await _case_to_out(db, case)
 
 
 @router.post("", response_model=CaseOut)
-def create_case(body: CaseCreate, db: Session = Depends(get_db)) -> CaseOut:
+async def create_case(body: CaseCreate, db: AsyncSession = Depends(get_db)) -> CaseOut:
     st = normalize_case_status(body.status)
     tid = (body.tenant_id or DEFAULT_TENANT_ID).strip() or DEFAULT_TENANT_ID
     case = Case(
@@ -309,9 +312,9 @@ def create_case(body: CaseCreate, db: Session = Depends(get_db)) -> CaseOut:
         status=st,
     )
     db.add(case)
-    db.commit()
-    db.refresh(case)
-    return _case_to_out(db, case)
+    await db.commit()
+    await db.refresh(case)
+    return await _case_to_out(db, case)
 
 
 def _remove_case_disk_warehouse(case: Case) -> None:
@@ -330,53 +333,56 @@ def _remove_case_disk_warehouse(case: Case) -> None:
             _log.warning("DuckDB unlink %s: %s", case.duckdb_path, exc)
 
 
-def _purge_all_cases_impl(db: Session) -> CasesPurgeOut:
-    """Delete all cases, per-case ingested CSV/DuckDB files, and global-warehouse rows (local reset)."""
-    rows = list(db.query(Case).order_by(Case.created_at.asc()).all())
+async def _purge_all_cases_impl(db: AsyncSession) -> CasesPurgeOut:
+    result = await db.execute(select(Case).order_by(Case.created_at.asc()))
+    rows = list(result.scalars().all())
     n = 0
     for c in rows:
         _remove_case_disk_warehouse(c)
         db.delete(c)
         n += 1
-    db.commit()
+    await db.commit()
     return CasesPurgeOut(ok=True, cases_removed=n)
 
 
 @router.post("/purge-all", response_model=CasesPurgeOut)
-def purge_all_cases_post(db: Session = Depends(get_db)) -> CasesPurgeOut:
-    return _purge_all_cases_impl(db)
+async def purge_all_cases_post(db: AsyncSession = Depends(get_db)) -> CasesPurgeOut:
+    return await _purge_all_cases_impl(db)
 
 
 @router.delete("/purge-all", response_model=CasesPurgeOut)
-def purge_all_cases_delete(db: Session = Depends(get_db)) -> CasesPurgeOut:
-    """Same as POST /purge-all — supports clients that cannot send POST JSON reliably."""
-    return _purge_all_cases_impl(db)
+async def purge_all_cases_delete(db: AsyncSession = Depends(get_db)) -> CasesPurgeOut:
+    return await _purge_all_cases_impl(db)
 
 
 @router.delete("/{case_id}")
-def delete_case(case_id: str, db: Session = Depends(get_db)) -> dict[str, bool]:
-    case = db.query(Case).filter(Case.id == case_id).first()
+async def delete_case(case_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, bool]:
+    result = await db.execute(select(Case).where(Case.id == case_id))
+    case = result.scalar_one_or_none()
     if not case:
         raise HTTPException(404, "Case not found")
     was_active = case.is_active
     _remove_case_disk_warehouse(case)
     db.delete(case)
-    db.commit()
+    await db.commit()
     if was_active:
-        remaining = db.query(Case).order_by(Case.created_at.desc()).first()
+        rem = await db.execute(select(Case).order_by(Case.created_at.desc()).limit(1))
+        remaining = rem.scalar_one_or_none()
         if remaining:
-            for x in db.query(Case).all():
+            all_c = await db.execute(select(Case))
+            for x in all_c.scalars().all():
                 x.is_active = x.id == remaining.id
-            db.commit()
+            await db.commit()
     return {"ok": True}
 
 
 @router.post("/activity-bulk", response_model=ActivityBulkResponse)
-def activity_bulk(body: ActivityBulkRequest, db: Session = Depends(get_db)) -> ActivityBulkResponse:
+async def activity_bulk(body: ActivityBulkRequest, db: AsyncSession = Depends(get_db)) -> ActivityBulkResponse:
     raw_ids = list(dict.fromkeys(body.case_ids))[:64]
     out: dict[str, ActivitySeriesPayload] = {}
     for cid in raw_ids:
-        case = db.query(Case).filter(Case.id == cid).first()
+        r = await db.execute(select(Case).where(Case.id == cid))
+        case = r.scalar_one_or_none()
         path = case.dataset_path if case else None
         payload = compute_case_activity(cid, path)
         out[cid] = ActivitySeriesPayload(**payload)
@@ -384,42 +390,47 @@ def activity_bulk(body: ActivityBulkRequest, db: Session = Depends(get_db)) -> A
 
 
 @router.patch("/{case_id}", response_model=CaseOut)
-def patch_case(case_id: str, body: CasePatch, db: Session = Depends(get_db)) -> CaseOut:
-    case = db.query(Case).filter(Case.id == case_id).first()
+async def patch_case(case_id: str, body: CasePatch, db: AsyncSession = Depends(get_db)) -> CaseOut:
+    result = await db.execute(select(Case).where(Case.id == case_id))
+    case = result.scalar_one_or_none()
     if not case:
         raise HTTPException(404, "Case not found")
     if body.name is not None:
         case.name = body.name
     if body.status is not None:
         case.status = normalize_case_status(body.status)
-    db.commit()
-    db.refresh(case)
-    return _case_to_out(db, case)
+    await db.commit()
+    await db.refresh(case)
+    return await _case_to_out(db, case)
 
 
 @router.post("/{case_id}/activate", response_model=CaseOut)
-def activate_case(case_id: str, db: Session = Depends(get_db)) -> CaseOut:
-    for c in db.query(Case).all():
+async def activate_case(case_id: str, db: AsyncSession = Depends(get_db)) -> CaseOut:
+    all_c = await db.execute(select(Case))
+    for c in all_c.scalars().all():
         c.is_active = c.id == case_id
-    db.commit()
-    case = db.query(Case).filter(Case.id == case_id).first()
+    await db.commit()
+    result = await db.execute(select(Case).where(Case.id == case_id))
+    case = result.scalar_one_or_none()
     if not case:
         raise HTTPException(404, "Case not found")
-    return _case_to_out(db, case)
+    return await _case_to_out(db, case)
 
 
 @router.get("/{case_id}/evidence", response_model=EvidenceBoardResponse)
-def get_evidence(case_id: str, db: Session = Depends(get_db)) -> EvidenceBoardResponse:
-    case = db.query(Case).filter(Case.id == case_id).first()
+async def get_evidence(case_id: str, db: AsyncSession = Depends(get_db)) -> EvidenceBoardResponse:
+    result = await db.execute(select(Case).where(Case.id == case_id))
+    case = result.scalar_one_or_none()
     if not case:
         raise HTTPException(404, "Case not found")
-    leads = db.query(Lead).filter(Lead.case_id == case_id).order_by(Lead.created_at.desc()).all()
-    audits = (
-        db.query(AuditLog)
-        .filter(AuditLog.case_id == case_id)
+    leads_r = await db.execute(select(Lead).where(Lead.case_id == case_id).order_by(Lead.created_at.desc()))
+    leads = leads_r.scalars().all()
+    aud_r = await db.execute(
+        select(AuditLog)
+        .where(AuditLog.case_id == case_id)
         .order_by(AuditLog.timestamp.asc(), AuditLog.id.asc())
-        .all()
     )
+    audits = aud_r.scalars().all()
     return EvidenceBoardResponse(
         leads=[LeadOut.model_validate(x) for x in leads],
         audit_logs=[AuditLogOut.model_validate(x) for x in audits],
@@ -427,22 +438,25 @@ def get_evidence(case_id: str, db: Session = Depends(get_db)) -> EvidenceBoardRe
 
 
 @router.patch("/{case_id}/leads/{lead_id}", response_model=LeadOut)
-def patch_lead(case_id: str, lead_id: str, body: LeadStatusPatch, db: Session = Depends(get_db)) -> Lead:
-    lead = db.query(Lead).filter(Lead.id == lead_id, Lead.case_id == case_id).first()
+async def patch_lead(case_id: str, lead_id: str, body: LeadStatusPatch, db: AsyncSession = Depends(get_db)) -> Lead:
+    result = await db.execute(select(Lead).where(Lead.id == lead_id, Lead.case_id == case_id))
+    lead = result.scalar_one_or_none()
     if not lead:
         raise HTTPException(404, "Lead not found")
     lead.status = body.status
-    db.commit()
-    db.refresh(lead)
+    await db.commit()
+    await db.refresh(lead)
     return lead
 
 
 @router.get("/{case_id}/workbench-pins", response_model=WorkbenchPinsOut)
-def get_workbench_pins(case_id: str, db: Session = Depends(get_db)) -> WorkbenchPinsOut:
-    case = db.query(Case).filter(Case.id == case_id).first()
+async def get_workbench_pins(case_id: str, db: AsyncSession = Depends(get_db)) -> WorkbenchPinsOut:
+    result = await db.execute(select(Case).where(Case.id == case_id))
+    case = result.scalar_one_or_none()
     if not case:
         raise HTTPException(404, "Case not found")
-    row = db.query(CaseWorkbenchPins).filter(CaseWorkbenchPins.case_id == case_id).first()
+    row_r = await db.execute(select(CaseWorkbenchPins).where(CaseWorkbenchPins.case_id == case_id))
+    row = row_r.scalar_one_or_none()
     if not row or not row.pins_json:
         return WorkbenchPinsOut(pins=[])
     pins = row.pins_json if isinstance(row.pins_json, list) else []
@@ -450,26 +464,82 @@ def get_workbench_pins(case_id: str, db: Session = Depends(get_db)) -> Workbench
 
 
 @router.put("/{case_id}/workbench-pins", response_model=WorkbenchPinsOut)
-def put_workbench_pins(case_id: str, body: WorkbenchPinsPut, db: Session = Depends(get_db)) -> WorkbenchPinsOut:
-    case = db.query(Case).filter(Case.id == case_id).first()
+async def put_workbench_pins(case_id: str, body: WorkbenchPinsPut, db: AsyncSession = Depends(get_db)) -> WorkbenchPinsOut:
+    result = await db.execute(select(Case).where(Case.id == case_id))
+    case = result.scalar_one_or_none()
     if not case:
         raise HTTPException(404, "Case not found")
     raw = [p.model_dump(by_alias=True) for p in body.pins[:24]]
-    row = db.query(CaseWorkbenchPins).filter(CaseWorkbenchPins.case_id == case_id).first()
+    row_r = await db.execute(select(CaseWorkbenchPins).where(CaseWorkbenchPins.case_id == case_id))
+    row = row_r.scalar_one_or_none()
     if row:
         row.pins_json = raw
     else:
         db.add(CaseWorkbenchPins(case_id=case_id, pins_json=raw))
-    db.commit()
+    await db.commit()
     return WorkbenchPinsOut(pins=raw)
 
 
+@router.get("/{case_id}/shares", response_model=list[CaseShareOut])
+async def list_case_shares(case_id: str, db: AsyncSession = Depends(get_db)) -> list[CaseShareOut]:
+    own = await db.execute(select(Case).where(Case.id == case_id))
+    if own.scalar_one_or_none() is None:
+        raise HTTPException(404, "Case not found")
+    sh = await db.execute(select(CaseShare).where(CaseShare.owner_case_id == case_id).order_by(CaseShare.id.asc()))
+    rows = sh.scalars().all()
+    return [CaseShareOut.model_validate(r) for r in rows]
+
+
+@router.post("/{case_id}/shares", response_model=CaseShareOut, status_code=201)
+async def create_case_share(
+    case_id: str,
+    body: CaseShareCreate,
+    db: AsyncSession = Depends(get_db),
+) -> CaseShareOut:
+    owner_r = await db.execute(select(Case).where(Case.id == case_id))
+    owner = owner_r.scalar_one_or_none()
+    if not owner:
+        raise HTTPException(404, "Owner case not found")
+    vid = (body.viewer_case_id or "").strip()
+    if not vid or vid == case_id:
+        raise HTTPException(400, "viewer_case_id must be set and different from owner case")
+    viewer_r = await db.execute(select(Case).where(Case.id == vid))
+    viewer = viewer_r.scalar_one_or_none()
+    if not viewer:
+        raise HTTPException(404, "Viewer case not found")
+    if str(owner.tenant_id) != str(viewer.tenant_id):
+        raise HTTPException(400, "Cases must belong to the same tenant to share warehouse data")
+    row = CaseShare(owner_case_id=case_id, viewer_case_id=vid)
+    db.add(row)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(409, "Share already exists or violates constraints") from exc
+    await db.refresh(row)
+    return CaseShareOut.model_validate(row)
+
+
+@router.delete("/{case_id}/shares/{viewer_case_id}")
+async def delete_case_share(case_id: str, viewer_case_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, bool]:
+    r = await db.execute(
+        select(CaseShare).where(CaseShare.owner_case_id == case_id, CaseShare.viewer_case_id == viewer_case_id)
+    )
+    row = r.scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "Share not found")
+    db.delete(row)
+    await db.commit()
+    return {"ok": True}
+
+
 @router.get("/{case_id}/preview")
-def preview(case_id: str, rows: int = 50, db: Session = Depends(get_db)):
-    case = db.query(Case).filter(Case.id == case_id).first()
+async def preview(case_id: str, rows: int = 50, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Case).where(Case.id == case_id))
+    case = result.scalar_one_or_none()
     if not case:
         raise HTTPException(400, "Case or dataset path missing")
-    path = resolve_with_active_fallback(db, case.dataset_path)
+    path = await resolve_with_active_fallback_async(db, case.dataset_path)
     if not path:
         raise HTTPException(400, "Case or dataset path missing")
     df = pl.read_csv(path, try_parse_dates=True, n_rows=rows)

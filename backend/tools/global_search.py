@@ -9,7 +9,13 @@ import polars as pl
 from backend.config import settings
 from backend.data.tenant_constants import DEFAULT_TENANT_ID
 from backend.data.warehouse import GlobalWarehouse
-from backend.data.warehouse_access import allowed_source_case_ids, tenant_id_for_case
+from backend.data.warehouse_access import (
+    allowed_source_case_ids,
+    install_warehouse_acl_schema,
+    new_acl_schema_name,
+    tenant_id_for_case,
+    teardown_warehouse_acl_schema,
+)
 from backend.data.warehouse_paths import tenant_warehouse_path
 from backend.database.duckdb_lock import duckdb_lock_path
 from backend.database.models import Case
@@ -273,10 +279,12 @@ def search_historical_overlap(
         }
 
     gw = GlobalWarehouse(db_path=wh_path)
+    acl_schema = new_acl_schema_name()
     with duckdb_lock_path(wh_path):
         con = gw._connect()
         try:
             gw.ensure_schema(con)
+            install_warehouse_acl_schema(con, acl_schema, allowed)
             cur = con.execute(
                 """
                 SELECT distinct_case_count, first_seen, last_seen, case_ids
@@ -359,6 +367,7 @@ def search_historical_overlap(
                 out["global_intelligence_match"] = True
             return out
         finally:
+            teardown_warehouse_acl_schema(con, acl_schema)
             con.close()
 
 

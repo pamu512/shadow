@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from backend.database import get_db
-from backend.database.dataset_path_resolve import resolve_with_active_fallback
+from backend.database.dataset_path_resolve import resolve_with_active_fallback_async
 from backend.database.models import Case
 from backend.schemas import OptimizeThresholdsRequest, OptimizeThresholdsResponse
 from backend.tools.optimize_thresholds import run_optimize
@@ -14,20 +16,26 @@ router = APIRouter(prefix="/api", tags=["thresholds"])
 
 
 @router.post("/optimize-thresholds", response_model=OptimizeThresholdsResponse)
-def optimize_thresholds(body: OptimizeThresholdsRequest, db: Session = Depends(get_db)) -> OptimizeThresholdsResponse:
+async def optimize_thresholds(
+    body: OptimizeThresholdsRequest, db: AsyncSession = Depends(get_db)
+) -> OptimizeThresholdsResponse:
     path = body.dataset_path
     if not path and body.case_id:
-        c = db.query(Case).filter(Case.id == body.case_id).first()
+        r = await db.execute(select(Case).where(Case.id == body.case_id))
+        c = r.scalar_one_or_none()
         path = c.dataset_path if c else None
-    path = resolve_with_active_fallback(db, path)
+    path = await resolve_with_active_fallback_async(db, path)
     if not path:
         raise HTTPException(400, "No dataset path provided (case CSV missing and no active case CSV).")
-    result = run_optimize(path, body.model, body.target_column, body.optimization_objective)
+    result = await run_in_threadpool(
+        run_optimize, path, body.model, body.target_column, body.optimization_objective
+    )
     if body.case_id:
-        c = db.query(Case).filter(Case.id == body.case_id).first()
+        r = await db.execute(select(Case).where(Case.id == body.case_id))
+        c = r.scalar_one_or_none()
         if c:
             c.last_optimization_manifest = result["optimization_manifest"]
-            db.commit()
+            await db.commit()
     return OptimizeThresholdsResponse(
         thresholds=result["thresholds"],
         optimization_manifest=result["optimization_manifest"],

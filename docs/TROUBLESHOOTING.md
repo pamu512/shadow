@@ -40,6 +40,16 @@ Use **`npm run build`** alone for the web bundle. Desktop: **`npm run desktop:bu
 
 Filenames must end in **`.csv`**; read the API error body for validation details.
 
+If parsing still fails after upload, confirm the file is not corrupted; local ingest uses **delimiter sniffing**—extremely irregular first lines can confuse the sniffer, in which case normalize headers or delimiter in a spreadsheet tool and re-export.
+
+## Database: `asyncpg` / `aiosqlite` errors
+
+FastAPI uses **async** SQLAlchemy. If you set `SHADOW_DATABASE_URL` to Postgres or SQLite, ensure matching drivers are installed (`asyncpg`, `aiosqlite` — listed in `pyproject.toml`). Sync-only URLs without a derivable async driver may fail at router startup.
+
+## Docker sandbox: `storage-opt` or pull errors
+
+The backend probes **`alpine`** once for `--storage-opt` support. If **`docker pull`** is blocked offline, pre-pull images or switch to **`SHADOW_SANDBOX_MODE=subprocess`** / **`pyodide`**. If Docker runs but logs storage driver errors for `storage-opt`, the probe should disable the size cap automatically; upgrade Docker or storage driver if runs still fail for other reasons.
+
 ## ESLint / TypeScript
 
 ```bash

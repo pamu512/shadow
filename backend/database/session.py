@@ -1,13 +1,19 @@
-"""SQLAlchemy engine, session, and SQLite migrations."""
+"""SQLAlchemy sync + async engines, sessions, and SQLite migrations."""
 from __future__ import annotations
 
-from collections.abc import Generator
+import asyncio
+import logging
+from collections.abc import AsyncGenerator, Generator
 
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from backend.case_status import DEFAULT_CASE_STATUS, normalize_case_status
 from backend.config import settings
+
+_log = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -22,6 +28,35 @@ engine = create_engine(settings.database_url, connect_args=_sqlite_connect_args(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+def _async_database_url() -> str:
+    """Derive async driver URL from the configured SQLAlchemy URL."""
+    raw = settings.database_url.strip()
+    if "aiosqlite" in raw or "asyncpg" in raw:
+        return raw
+    try:
+        u = make_url(raw)
+    except Exception:  # noqa: BLE001
+        return raw
+    d = u.drivername
+    if d == "sqlite":
+        return str(u.set(drivername="sqlite+aiosqlite"))
+    if d.startswith("postgresql"):
+        return str(u.set(drivername="postgresql+asyncpg"))
+    _log.warning("Unknown DB driver %s for async; async API may fail", d)
+    return raw
+
+
+_async_connect_args: dict = {}
+if settings.database_url.startswith("sqlite"):
+    _async_connect_args["check_same_thread"] = False
+
+_ae_kw: dict = {"pool_pre_ping": True}
+if _async_connect_args:
+    _ae_kw["connect_args"] = _async_connect_args
+async_engine = create_async_engine(_async_database_url(), **_ae_kw)
+AsyncSessionLocal = async_sessionmaker(async_engine, autocommit=False, autoflush=False, expire_on_commit=False)
+
+
 @event.listens_for(engine, "connect")
 def _sqlite_pragma(dbapi_conn, _connection_record) -> None:
     if settings.database_url.startswith("sqlite"):
@@ -30,12 +65,19 @@ def _sqlite_pragma(dbapi_conn, _connection_record) -> None:
         cur.close()
 
 
-def get_db() -> Generator:
+def get_db_sync() -> Generator:
+    """Synchronous session (LangGraph tools, warehouse ACL helpers, etc.)."""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Async session for FastAPI routers (horizontal scaling / non-blocking I/O)."""
+    async with AsyncSessionLocal() as session:
+        yield session
 
 
 def ensure_sqlite_migrations() -> None:
@@ -107,3 +149,10 @@ def ensure_sqlite_migrations() -> None:
                 """
             )
         )
+
+
+async def init_db_schema_async() -> None:
+    """Create tables on startup (async engine); SQLite migrations run on sync engine."""
+    await asyncio.to_thread(ensure_sqlite_migrations)
+    async with async_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)

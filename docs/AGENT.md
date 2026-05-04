@@ -2,7 +2,7 @@
 
 ## Overview
 
-Shadow’s **Agent Console** sends messages to **`POST /api/chat`**, which runs a **LangGraph** application (`backend/agent/graph.py`):
+Shadow’s **Agent Console** sends messages to `**POST /api/chat`**, which runs a **LangGraph** application (`backend/agent/graph.py`):
 
 1. **Context injection** — Injects case/schema hints where configured (`reasoning_hooks.py`).
 2. **Supervisor** — Classifies the last user turn and routes to **code**, **ML**, or **analyst** subgraph.
@@ -12,7 +12,7 @@ The compiled graph is **cached per persona**; `thread_reset` on the chat request
 
 ## Personas (lenses)
 
-Personas are defined in **`backend/agents/registry.py`** and surfaced to the UI via **`GET /api/personas`**. Each persona includes:
+Personas are defined in `**backend/agents/registry.py`** and surfaced to the UI via `**GET /api/personas`**. Each persona includes:
 
 - `system_prompt` + optional suffix (warehouse rules, confidence policy)
 - `allowed_tool_names` — strict allowlist for the analyst ReAct agent
@@ -20,17 +20,19 @@ Personas are defined in **`backend/agents/registry.py`** and surfaced to the UI 
 
 Examples (not exhaustive — see registry):
 
-| Persona id | Focus |
-| ---------- | ----- |
-| `general` | Cross-case warehouse, overlap search, trust/velocity, Humanoid linkage |
-| `chargeback_specialist` | Disputes, representment, chargeback risk |
-| `bot_hunter` | Bot clusters, hardware/IP forensics |
-| `fraud_ring_detective` | Graph rings, roles |
-| `fraud_playbook_architect` | Extended playbook + extra tools (see `fraud_playbook_context.md`) |
+
+| Persona id                 | Focus                                                                  |
+| -------------------------- | ---------------------------------------------------------------------- |
+| `general`                  | Cross-case warehouse, overlap search, trust/velocity, Humanoid linkage |
+| `chargeback_specialist`    | Disputes, representment, chargeback risk                               |
+| `bot_hunter`               | Bot clusters, hardware/IP forensics                                    |
+| `fraud_ring_detective`     | Graph rings, roles                                                     |
+| `fraud_playbook_architect` | Extended playbook + extra tools (see `fraud_playbook_context.md`)      |
+
 
 ## Analyst tools (representative)
 
-Implemented in **`backend/agent/tools_langchain.py`** (names must match allowlists):
+Implemented in `**backend/agent/tools_langchain.py`** (names must match allowlists):
 
 - `get_dataset_schema` — CSV column summary for active case  
 - `execute_in_sandbox` — Python/R in a restricted environment  
@@ -66,4 +68,15 @@ Prompt assembly: `backend/agent/coordinator.py` (`build_analyst_system_prompt`, 
 
 ## LLM backend
 
-LangChain **`ChatOpenAI`**-compatible client points at **Ollama** by default (`SHADOW_OLLAMA_*`). Any OpenAI-compatible endpoint can be used if URLs/keys are adjusted.
+LangChain `**ChatOpenAI`**-compatible client points at **Ollama** by default (`SHADOW_OLLAMA_`*). Any OpenAI-compatible endpoint can be used if URLs/keys are adjusted.
+
+## Tool output confidence (RFI / UI)
+
+Per-tool JSON can receive a **confidence score** in `[0, 1]` for analyst-facing UI:
+
+1. If the payload already includes `confidence_score`, that value wins.
+2. If `**SHADOW_LLM_TOOL_CONFIDENCE=true`**, a small structured LLM call scores the payload (with heuristic fallback on errors).
+3. Otherwise, if `**<SHADOW_DATA_DIR>/tool_confidence.onnx`** exists, **ONNX Runtime** runs a lightweight forest on encoded features (`ok`, row count band, `truncated`, `global_hits`, severity-style flags). Train or refresh the file with `**python -m backend.agent.train_confidence_model`**.
+4. If no ONNX file is present, **deterministic heuristics** in `backend/agent/tool_confidence.py` apply.
+
+Warehouse tools still benefit from **DuckDB ACL views** (see [ARCHITECTURE.md](./ARCHITECTURE.md)); confidence scoring is separate from row isolation.

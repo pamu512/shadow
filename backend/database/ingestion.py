@@ -1,6 +1,7 @@
 """DuckDB-backed CSV ingestion into per-case analytical stores."""
 from __future__ import annotations
 
+import csv
 import io
 import logging
 import re
@@ -38,9 +39,22 @@ def read_csv_to_polars(path: Path) -> pl.DataFrame:
     except Exception:  # noqa: BLE001
         text = raw.decode("utf-8", errors="replace")
 
+    sample = text[:10_000]
+    delimiter = ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        delimiter = dialect.delimiter or ","
+    except Exception:  # noqa: BLE001
+        pass
+
     buf = io.StringIO(text)
     try:
-        return pl.read_csv(buf, infer_schema_length=50_000, try_parse_dates=True)
+        return pl.read_csv(
+            buf,
+            separator=delimiter,
+            infer_schema_length=50_000,
+            try_parse_dates=True,
+        )
     except Exception as polars_exc:  # noqa: BLE001
         _log.warning("Polars read_csv failed (%s); trying Pandas fallback", polars_exc)
         try:
@@ -49,6 +63,7 @@ def read_csv_to_polars(path: Path) -> pl.DataFrame:
             buf.seek(0)
             pdf = pd.read_csv(
                 buf,
+                sep=delimiter,
                 on_bad_lines="warn",
                 engine="python",
                 encoding_errors="replace",

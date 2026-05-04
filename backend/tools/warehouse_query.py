@@ -10,7 +10,14 @@ import duckdb
 
 from backend.config import settings
 from backend.data.tenant_constants import DEFAULT_TENANT_ID
-from backend.data.warehouse_access import allowed_source_case_ids, resolve_tenant_warehouse_path, scope_warehouse_sql
+from backend.data.warehouse_access import (
+    allowed_source_case_ids,
+    install_warehouse_acl_schema,
+    new_acl_schema_name,
+    resolve_tenant_warehouse_path,
+    teardown_warehouse_acl_schema,
+    warehouse_sql_acl_precheck,
+)
 from backend.database.duckdb_lock import duckdb_lock_path
 from backend.database.ingestion import _configure_duckdb
 from backend.database.session import SessionLocal
@@ -54,6 +61,9 @@ def validate_readonly_select(sql: str) -> tuple[bool, str]:
         return False, "Forbidden DDL/DML keywords detected in query."
     if "--" in raw or "/*" in raw:
         return False, "SQL comments are not allowed; use a plain SELECT."
+    ok_acl, err_acl = warehouse_sql_acl_precheck(raw)
+    if not ok_acl:
+        return False, err_acl
     return True, ""
 
 
@@ -90,12 +100,13 @@ def run_warehouse_query(
             "error": "Tenant warehouse not initialized (no database file yet).",
             "kind": "warehouse_query",
         }
-    scoped = scope_warehouse_sql(sql, allowed)
+    schema = new_acl_schema_name()
     with duckdb_lock_path(path):
-        con = duckdb.connect(str(path), read_only=True)
+        con = duckdb.connect(str(path), read_only=False)
         try:
             _configure_duckdb(con)
-            cur = con.execute(scoped)
+            install_warehouse_acl_schema(con, schema, allowed)
+            cur = con.execute(sql)
             desc = cur.description or []
             columns = [d[0] for d in desc]
             rows = cur.fetchmany(_MAX_ROWS + 1)
@@ -121,6 +132,7 @@ def run_warehouse_query(
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc), "kind": "warehouse_query"}
         finally:
+            teardown_warehouse_acl_schema(con, schema)
             con.close()
 
 
@@ -156,11 +168,11 @@ def run_warehouse_text_search(
         ORDER BY upload_timestamp ASC
         LIMIT ?
     """
-    scoped = scope_warehouse_sql(sql, allowed)
     return _run_parameterized(
         path,
-        scoped,
+        sql,
         [pattern, pattern, lim],
+        allowed,
         kind="warehouse_text_search",
         needle=n,
     )
@@ -170,14 +182,17 @@ def _run_parameterized(
     path: Path,
     sql: str,
     params: list[Any],
+    allowed: frozenset[str],
     *,
     kind: str,
     needle: str | None = None,
 ) -> dict[str, Any]:
+    schema = new_acl_schema_name()
     with duckdb_lock_path(path):
-        con = duckdb.connect(str(path), read_only=True)
+        con = duckdb.connect(str(path), read_only=False)
         try:
             _configure_duckdb(con)
+            install_warehouse_acl_schema(con, schema, allowed)
             cur = con.execute(sql, params)
             desc = cur.description or []
             columns = [d[0] for d in desc]
@@ -205,4 +220,5 @@ def _run_parameterized(
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc), "kind": kind}
         finally:
+            teardown_warehouse_acl_schema(con, schema)
             con.close()

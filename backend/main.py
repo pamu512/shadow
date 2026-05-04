@@ -24,7 +24,7 @@ from backend.api.routers import (
     thresholds,
     warehouse,
 )
-from backend.database import Base, engine, ensure_sqlite_migrations
+from backend.database import init_db_schema_async
 from backend.rag.knowledge_store import ensure_ingested
 from backend.realtime.evidence_hub import EvidenceHub, run_evidence_event_pump
 
@@ -47,8 +47,7 @@ _ensure_backend_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    ensure_sqlite_migrations()
+    await init_db_schema_async()
     hub = EvidenceHub()
     app.state.evidence_hub = hub
     pump = asyncio.create_task(run_evidence_event_pump(hub))

@@ -55,16 +55,16 @@
 | ----- | ---------- |
 | UI | React 19, TypeScript, Vite 8, Tailwind CSS 4 |
 | Desktop (optional) | Tauri 2 (Rust) — spawns Python, exposes API base + **Restart API** |
-| API | FastAPI, Uvicorn |
-| Persistence | SQLite (SQLAlchemy), CSV + DuckDB artifacts under `.data/` |
-| Graphs / ML | NetworkX, scikit-learn |
+| API | FastAPI, Uvicorn (**async** database sessions for routers; sync engine retained for LangGraph and migrations) |
+| Persistence | SQLite or Postgres (SQLAlchemy); CSV + DuckDB artifacts under `.data/` |
+| Graphs / ML | NetworkX, scikit-learn, optional **ONNX Runtime** for fast tool-confidence scoring |
 | Agent | LangGraph, LangChain tools |
 
 ```text
 React (Vite) ──HTTP/WS──► FastAPI (backend.main)
-                              ├── SQLite
-                              ├── storage / DuckDB
-                              └── LangGraph (chat + tools)
+                              ├── SQLite / Postgres (async ORM in routers)
+                              ├── storage / DuckDB (per case + global warehouse)
+                              └── LangGraph (chat + tools; sync DB where needed)
 ```
 
 **Deep dive:** [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
@@ -134,8 +134,9 @@ npm run dev
 | Variable | Purpose | Default |
 | -------- | ------- | ------- |
 | `SHADOW_API_PORT` | Sidecar port (Tauri uses the same) | `8742` |
-| `SHADOW_DATA_DIR` | SQLite + storage root | `<repo>/.data` |
-| `SHADOW_WORKSPACE_DIR` | Sandbox scratch | `<repo>/workspace` |
+| `SHADOW_DATA_DIR` | Default root for SQLite file (when URL not set), uploads, and `tool_confidence.onnx` | `<repo>/.data` |
+| `SHADOW_DATABASE_URL` | SQLAlchemy URL; FastAPI uses an **async** driver derived from it (`sqlite+aiosqlite`, `postgresql+asyncpg`) when applicable | *(see [CONFIGURATION.md](./docs/CONFIGURATION.md))* |
+| `SHADOW_WORKSPACE_DIR` | Sandbox scratch; subprocess runs use a **unique** `cwd_<uuid>` per execution | `<repo>/workspace` |
 | `SHADOW_OLLAMA_BASE_URL` | LLM base URL | `http://localhost:11434/v1` |
 | `SHADOW_OLLAMA_MODEL` | Model id | `llama3.2` |
 | `SHADOW_DEBUG_AGENT` | Verbose agent debug JSON | `false` |
@@ -149,9 +150,10 @@ npm run dev
 
 ## Data on disk
 
-- **SQLite** — `.data/shadow.db` (legacy: `.data/fraud_copilot.db`)
+- **SQLite / Postgres** — default SQLite file under `SHADOW_DATA_DIR`: `shadow.db` (legacy: `fraud_copilot.db`); override with `SHADOW_DATABASE_URL`.
 - **Uploads / DuckDB** — `.data/storage/`
 - **Preferences** — `.data/preferences.json`
+- **Tool confidence ONNX** (optional) — `.data/tool_confidence.onnx`; generate with `python -m backend.agent.train_confidence_model` after `pip install -e .` (see [docs/CONFIGURATION.md](./docs/CONFIGURATION.md)).
 
 Do **not** commit `.data/` or `.venv/`.
 
@@ -175,11 +177,11 @@ Do **not** commit `.data/` or `.venv/`.
 Routers are mounted in **`backend/main.py`**. Highlights:
 
 - **`GET /health`**, **`GET/PATCH /llm-preferences`**, **`GET /ollama-models`**
-- **`/api/cases/*`** — CRUD, upload, preview, activity, evidence, leads, purge
+- **`/api/cases/*`** — CRUD, upload, preview, activity, evidence, leads, purge, **case shares** (`GET`/`POST` `/api/cases/{id}/shares`, `DELETE` … `/shares/{viewer_case_id}`)
 - **`POST /api/chat`** — Agent (optional `case_id`, `persona_id`, `thread_reset`)
 - **`/api/cases/{id}/network/*`**, **`/api/cases/{id}/chargeback/*`**, **`/api/cases/{id}/bots/*`**, ATO routes
 - **`POST /api/execute`**, **`/api/code-review`**, **`/api/scaffold`**, **`/api/optimize-thresholds`**
-- **`/api/warehouse/*`** — global warehouse reads
+- **`/api/warehouse/*`** — global warehouse reads (queries run against **filtered views** in an ephemeral DuckDB schema scoped to allowed case IDs)
 - **`WS /ws/cases/{case_id}/evidence`**
 
 **Route map:** [docs/API.md](./docs/API.md) — **always prefer `/docs` live** for schemas and try-it-out.
@@ -207,7 +209,9 @@ Response is XML (`application/xml`) for **GEXF** or **GraphML**. Omit column ove
 ## Security & privacy
 
 - Designed for **local** investigation: bind to **loopback** in dev; treat the machine as the trust boundary.
-- **RestrictedPython** and sandbox policy constrain `execute` paths; still treat CSVs and user code as **untrusted**.
+- **RestrictedPython** and sandbox policy constrain `execute` paths; still treat CSVs and user code as **untrusted**. Subprocess and Pyodide Python runs use a **dedicated working directory per run** under `SHADOW_WORKSPACE_DIR` so concurrent jobs cannot see each other’s cwd-relative paths.
+- **Docker** sandbox mode probes **`--storage-opt`** once at startup; the size cap is applied only if the daemon supports it (avoids hard failures on drivers that reject `storage-opt`).
+- **Warehouse isolation** is enforced in DuckDB via a temporary schema and **views** over `warehouse_events` / entity tables, not client-side SQL rewriting. **Case shares** explicitly grant another case read overlap into an owner case’s warehouse slice.
 - Use disk encryption and OS access controls for `.data/` when handling sensitive PII.
 
 ---

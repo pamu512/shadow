@@ -19,6 +19,7 @@ Below is a **route map** by prefix. Paths are relative to the API root (e.g. `ht
 | Prefix | Examples |
 | ------ | -------- |
 | `/api/cases` | List/create cases, upload CSV, preview, activity, activate, delete |
+| `/api/cases/{id}/shares` | **Case sharing:** `GET` list, `POST` body `{ "viewer_case_id": "<uuid>" }`, `DELETE /api/cases/{id}/shares/{viewer_case_id}` |
 | `/api/cases/{id}/evidence` | Evidence board payload (GET) |
 | `/api/cases/{id}/leads/{lead_id}` | PATCH lead status |
 | `DELETE` | `/api/cases/{id}`, `/api/cases/purge-all` (or POST purge — see router) |
@@ -66,7 +67,11 @@ Routes under **`/api/cases/...`** for ATO-oriented analysis (see `/docs`).
 
 | Prefix | Role |
 | ------ | ---- |
-| `/api/warehouse/*` | Read-only warehouse SQL / text search (see router) |
+| `/api/warehouse/*` | Read-only warehouse SQL / text search (see router). The backend installs **filtered views** in a temporary DuckDB schema and sets the session schema so unqualified table names resolve only to rows allowed for the current case (plus any **shared** viewer cases). |
+
+## Concurrency
+
+Most **case-scoped** routers are **`async def`** and use **Async SQLAlchemy**; long synchronous work (LLM chat, DuckDB analytics, file-heavy tools) runs in a **thread pool** so the event loop stays responsive.
 
 ## WebSocket
 

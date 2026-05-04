@@ -4,21 +4,24 @@ from __future__ import annotations
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from backend.database import get_db
 from backend.database.models import Case
 from backend.schemas import AtoAnalyzeRequest, AtoKillSessionRequest, AtoUserRequest
 from backend.tools.ato_analyzer import analyze_ato_risk
 from backend.tools.ato_columns import fetch_column_names, quote_ident, resolve_ato_columns
-from backend.tools.audit_log import record_audit
+from backend.tools.audit_log import record_audit_async
 from backend.tools.user_profiler import build_user_behavioral_profile
 
 router = APIRouter(prefix="/api/cases", tags=["ato"])
 
 
-def _get_case(case_id: str, db: Session) -> Case:
-    row = db.query(Case).filter(Case.id == case_id).first()
+async def _get_case(case_id: str, db: AsyncSession) -> Case:
+    r = await db.execute(select(Case).where(Case.id == case_id))
+    row = r.scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="Case not found")
     return row
@@ -34,11 +37,12 @@ def _duckdb_or_400(case: Case) -> str:
 
 
 @router.post("/{case_id}/ato/profile")
-def ato_profile(case_id: str, body: AtoUserRequest, db: Session = Depends(get_db)) -> dict:
+async def ato_profile(case_id: str, body: AtoUserRequest, db: AsyncSession = Depends(get_db)) -> dict:
     """Behavioral DNA baseline for a user from historical rows."""
-    case = _get_case(case_id, db)
+    case = await _get_case(case_id, db)
     duck = _duckdb_or_400(case)
-    return build_user_behavioral_profile(
+    return await run_in_threadpool(
+        build_user_behavioral_profile,
         duck,
         body.user_id,
         user_column=body.user_column,
@@ -46,12 +50,13 @@ def ato_profile(case_id: str, body: AtoUserRequest, db: Session = Depends(get_db
 
 
 @router.post("/{case_id}/ato/analyze")
-def ato_analyze(case_id: str, body: AtoAnalyzeRequest, db: Session = Depends(get_db)) -> dict:
+async def ato_analyze(case_id: str, body: AtoAnalyzeRequest, db: AsyncSession = Depends(get_db)) -> dict:
     """Compare current_session to DuckDB baseline; returns flags + discrepancies."""
-    case = _get_case(case_id, db)
+    case = await _get_case(case_id, db)
     duck = _duckdb_or_400(case)
     uid = (body.user_id or "").strip()
-    return analyze_ato_risk(
+    return await run_in_threadpool(
+        analyze_ato_risk,
         duck,
         uid,
         body.current_session,
@@ -59,19 +64,11 @@ def ato_analyze(case_id: str, body: AtoAnalyzeRequest, db: Session = Depends(get
     )
 
 
-@router.get("/{case_id}/ato/user-id-samples")
-def ato_user_id_samples(
-    case_id: str,
-    db: Session = Depends(get_db),
-    limit: int = Query(40, ge=1, le=200),
-) -> dict:
-    """Distinct account / user ids from the case DuckDB for quick-pick UX."""
+def _ato_user_id_samples_sync(duck: str, limit: int) -> dict:
     import duckdb as ddb
 
     from backend.database.ingestion import _configure_duckdb
 
-    case = _get_case(case_id, db)
-    duck = _duckdb_or_400(case)
     con = ddb.connect(str(duck), read_only=True)
     try:
         try:
@@ -106,12 +103,24 @@ def ato_user_id_samples(
         con.close()
 
 
+@router.get("/{case_id}/ato/user-id-samples")
+async def ato_user_id_samples(
+    case_id: str,
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(40, ge=1, le=200),
+) -> dict:
+    """Distinct account / user ids from the case DuckDB for quick-pick UX."""
+    case = await _get_case(case_id, db)
+    duck = _duckdb_or_400(case)
+    return await run_in_threadpool(_ato_user_id_samples_sync, duck, limit)
+
+
 @router.post("/{case_id}/ato/kill-session")
-def ato_kill_session(case_id: str, body: AtoKillSessionRequest, db: Session = Depends(get_db)) -> dict:
+async def ato_kill_session(case_id: str, body: AtoKillSessionRequest, db: AsyncSession = Depends(get_db)) -> dict:
     """SOC stub: records revocation intent; wire to your IdP/token service for production."""
-    _get_case(case_id, db)
+    await _get_case(case_id, db)
     payload = body.model_dump()
-    record_audit(
+    await record_audit_async(
         db,
         case_id=case_id,
         action_taken="ATO_KILL_SESSION",

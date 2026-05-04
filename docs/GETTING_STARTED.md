@@ -28,6 +28,16 @@ pip install -e .
 # or: uv pip install -e .
 ```
 
+### Optional: tool-confidence ONNX bundle
+
+For faster, non-LLM **tool output confidence** scores (used when `SHADOW_LLM_TOOL_CONFIDENCE` is `false`), generate the default model artifact:
+
+```bash
+python -m backend.agent.train_confidence_model
+```
+
+That writes **`<repo>/.data/tool_confidence.onnx`** (same directory family as `SHADOW_DATA_DIR`). Skip this step if you are fine with heuristic-only scoring until you train your own model.
+
 ## 4. Choose how you run the stack
 
 ### Option A — Full desktop (recommended for daily use)

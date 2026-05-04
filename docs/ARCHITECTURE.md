@@ -18,13 +18,14 @@
 └───────┬─────────────────────────────────────┬─────────────┘
         │                                     │
         ▼                                     ▼
-┌───────────────┐                    ┌────────────────────┐
-│ SQLite        │                    │ Files & analytics   │
-│ (SQLAlchemy)  │                    │ • CSV storage       │
-│ `.data/*.db`  │                    │ • DuckDB per case   │
-└───────────────┘                    │ • Polars / NetworkX │
-                                       │ • sklearn / sandbox │
-                                       └────────────────────┘
+┌────────────────────────┐         ┌─────────────────────────────────┐
+│ SQLite / Postgres      │         │ Files & analytics               │
+│ SQLAlchemy             │         │ • CSV storage + delimiter sniff │
+│ • AsyncSession (HTTP)  │         │ • DuckDB per case               │
+│ • Sync sessions (agent)│         │ • Warehouse DuckDB + ACL views  │
+└────────────────────────┘         │ • Polars / NetworkX / sandbox   │
+                                    │ • sklearn + optional ONNX RT    │
+                                    └─────────────────────────────────┘
 ```
 
 ## Repository layout
@@ -36,8 +37,8 @@
 | `src-tauri/` | Tauri Rust crate: window, **Python sidecar spawn**, `get_api_base_url`, `restart_sidecar` |
 | `pyproject.toml` | Python package `shadow-backend`, runtime dependencies |
 | `package.json` | Node scripts, frontend + Tauri CLI deps |
-| `.data/` | **Local only** — SQLite, uploads, DuckDB, `preferences.json` (gitignored) |
-| `workspace/` | Scratch space for sandbox runs (gitignored as configured) |
+| `.data/` | **Local only** — SQLite (or Postgres data elsewhere), uploads, DuckDB, `preferences.json`, optional `tool_confidence.onnx` (gitignored) |
+| `workspace/` | Scratch for sandbox runs; ephemeral **`cwd_<uuid>/`** dirs during subprocess/Pyodide Python (gitignored as configured) |
 
 ## Agent runtime
 
@@ -50,6 +51,15 @@ See [AGENT.md](./AGENT.md) for personas and tool list.
 ## Realtime
 
 - **`EvidenceHub`** (`backend/realtime/evidence_hub.py`) fans out lead and board events to WebSocket subscribers per `case_id`.
+
+## Warehouse access control
+
+- **`backend/data/warehouse_access.py`** builds a unique DuckDB schema (for example `whacl_<uuid>`), creates **views** over `main.warehouse_events`, `main.entity_occurrences`, and `main.entity_map` filtered to an **allowed case id set** (the active case plus **case share** targets), runs `SET schema = …`, then tears the schema down after the query.
+- **`warehouse_query_tool`** / **`global_search`** install this ACL around user SQL or internal selects so isolation is **database-enforced**.
+
+## Sandboxing
+
+- **Subprocess / Pyodide:** each Python job uses **`workspace/cwd_<uuid>/`** as **cwd**; Docker mode optionally applies **`--storage-opt size=1G`** only after a one-time capability probe (`backend/sandbox/docker_runner.py`).
 
 ## CORS
 
