@@ -26,11 +26,15 @@ from backend.tools.optimize_thresholds import run_optimize
 from backend.tools.network_analyzer import find_fraud_rings
 from backend.tools.ring_profiler import summarize_roles
 from backend.tools.sandbox_exec import execute_code
+from backend.tools.amount_input import normalize_mapping_amount_fields, parse_loose_amount
 from backend.tools.scaffold_code import generate_scaffold
 from backend.tools.global_search import search_historical_overlap as run_search_historical_overlap
 from backend.tools.user_profiler import build_user_behavioral_profile
 from backend.tools.humanoid_linkage import run_humanoid_stress_test_linkage
 from backend.tools.warehouse_query import run_warehouse_query, run_warehouse_text_search
+from backend.rag.knowledge_store import search_knowledge
+from backend.tools.fingerprint_velocity import analyze_canvas_ip_velocity
+from backend.tools.ml_process_runner import run_isolation_forest_in_process, run_xgboost_in_process
 
 from .ollama import get_llm
 from .tool_self_heal import mentions_missing_user_identifier, rank_user_column_candidates, strip_traceback_for_agent_ui
@@ -68,9 +72,19 @@ def review_script_tool(script: str, language: Literal["python", "r"]) -> str:
 
 
 @tool
-def scaffold_code_tool(language: Literal["python", "r"], intent: str) -> str:
-    """Generate Polars or data.table scaffold code."""
-    code, explanation = generate_scaffold(language, intent)
+def scaffold_code_tool(
+    language: Literal["python", "r"],
+    intent: str = "",
+) -> str:
+    """Generate Polars or data.table scaffold code.
+
+    Args:
+        language: Target language for the snippet.
+        intent: What the script should accomplish (e.g. segment dispute rates, velocity by user).
+            If omitted, a generic fraud-analytics pipeline scaffold is returned.
+    """
+    resolved = intent.strip() or "General fraud analytics (refine intent for tighter scaffolds)"
+    code, explanation = generate_scaffold(language, resolved)
     return f"{explanation}\n\n```\n{code}\n```"
 
 
@@ -144,7 +158,7 @@ def emit_lead(severity: float, description: str, raw_data_snippet: str) -> str:
     try:
         parsed = json.loads(raw_data_snippet)
         if isinstance(parsed, dict):
-            raw_data = parsed
+            raw_data = normalize_mapping_amount_fields(parsed)
         else:
             raw_data = {"value": parsed}
     except json.JSONDecodeError:
@@ -179,16 +193,24 @@ def build_code_tools() -> list:
 
 
 def build_ml_tools() -> list:
-    return [get_dataset_schema, optimize_thresholds_tool, execute_in_sandbox, emit_lead]
+    return [
+        get_dataset_schema,
+        optimize_thresholds_tool,
+        isolation_forest_scan_tool,
+        xgboost_fraud_train_tool,
+        execute_in_sandbox,
+        emit_lead,
+    ]
 
 
 @tool
 def chargeback_trust_velocity_tool(
-    target_amount: float = 0.0,
+    target_amount: str | float | int | None = None,
     transaction_id: str = "",
 ) -> str:
     """PROACTIVE Trust vs. Velocity scan on the active case CSV: isolates disputed/focal row, counts prior
-    completed orders for the same user, compares average historical amount to the focal amount, checks IP/device
+    completed orders for the same user, compares average historical amount to the focal amount (``target_amount``
+    accepts numbers or strings like ``$1,234.56``), checks IP/device
     reuse vs warm-up, and labels **Potential Account Seasoning for Friendly Fraud** when focal >10× average with
     enough prior completed rows. Call immediately after get_dataset_schema when the operator asks about a specific
     transaction or genuineness (do not ask for raw snippets if the CSV is in context). Returns JSON with
@@ -196,7 +218,7 @@ def chargeback_trust_velocity_tool(
     path = dataset_path_ctx.get()
     if not path:
         return json.dumps({"ok": False, "error": "No dataset path in context.", "kind": "forensic_verdict_card"})
-    ta = float(target_amount) if target_amount else None
+    ta = parse_loose_amount(target_amount) if target_amount is not None else None
     if ta is not None and ta <= 0:
         ta = None
     tid = (transaction_id or "").strip() or None
@@ -542,6 +564,7 @@ def analyze_ato_risk_tool(user_id: str = "", current_session_json: str = "{}", u
         return json.dumps({"ok": False, "error": f"Invalid JSON: {exc}"})
     if not isinstance(sess, dict):
         return json.dumps({"ok": False, "error": "current_session_json must decode to an object."})
+    sess = normalize_mapping_amount_fields(sess)
     uc = (user_column or "").strip() or None
     return json.dumps(analyze_ato_risk(p, uid, sess, user_column=uc), default=str)
 
@@ -573,10 +596,61 @@ def warehouse_query_tool(sql: str) -> str:
 
 
 @tool
-def warehouse_search_text_tool(needle: str, limit: int = 40) -> str:
+def warehouse_search_text_tool(needle: str) -> str:
     """Search ingested warehouse_events for a substring in row_json or source_filename (dataset names, stress tests, tags).
-    Call when the operator names a specific test or table before answering from memory."""
-    return json.dumps(run_warehouse_text_search(needle, limit=int(limit or 40)), default=str)
+    Call when the operator names a specific test or table before answering from memory. Row cap is fixed server-side."""
+    return json.dumps(run_warehouse_text_search(needle, limit=40), default=str)
+
+
+def _knowledge_retriever_body(query: str, top_k: int) -> str:
+    k = min(12, max(1, int(top_k)))
+    hits = search_knowledge(query or "", top_k=k)
+    return json.dumps({"ok": True, "hits": hits}, default=str)
+
+
+@tool("knowledge_retriever")
+def knowledge_retriever(query: str, top_k: int = 5) -> str:
+    """Retrieve embedded fraud playbook / tribal knowledge (RAG). Use for policy tiers, investigation checklists,
+    and pattern names before asserting organization-specific rules. Pass a short natural-language query."""
+    return _knowledge_retriever_body(query, top_k)
+
+
+@tool
+def canvas_ip_velocity_tool() -> str:
+    """DuckDB: dominant canvas_fingerprint concentration vs distinct IPs + high IP-velocity user×IP pairs (1h window).
+    Use after ingest when investigating hardware spoofing or scripted logins."""
+    p = duckdb_path_ctx.get()
+    if not p:
+        return json.dumps({"ok": False, "error": "No DuckDB in context; ingest a CSV for this case first."})
+    return json.dumps(analyze_canvas_ip_velocity(p), default=str)
+
+
+@tool
+def isolation_forest_scan_tool(contamination: float = 0.02) -> str:
+    """Unsupervised Isolation Forest over numeric CSV columns; returns top anomalous rows (bot / rare combos)."""
+    path = dataset_path_ctx.get()
+    if not path:
+        return json.dumps({"ok": False, "error": "No dataset path in context."})
+    try:
+        c = float(contamination)
+    except (TypeError, ValueError):
+        c = 0.02
+    result = run_isolation_forest_in_process(path, c, timeout_sec=300)
+    return json.dumps(result, default=str)
+
+
+@tool
+def xgboost_fraud_train_tool(target_column: str) -> str:
+    """Supervised fraud classifier on the active CSV (XGBoost when installed, else HistGradientBoosting). Requires a
+    binary / 0-1 label column name (e.g. is_fraud, label, chargeback). Returns AP/AUC and feature importances."""
+    path = dataset_path_ctx.get()
+    if not path:
+        return json.dumps({"ok": False, "error": "No dataset path in context."})
+    tc = (target_column or "").strip()
+    if not tc:
+        return json.dumps({"ok": False, "error": "target_column required (label column in CSV)."})
+    result = run_xgboost_in_process(path, tc, timeout_sec=600)
+    return json.dumps(result, default=str)
 
 
 @tool
@@ -597,6 +671,10 @@ _TOOL_BY_NAME: dict[str, object] = {
     "get_dataset_schema": get_dataset_schema,
     "execute_in_sandbox": execute_in_sandbox,
     "emit_lead": emit_lead,
+    "knowledge_retriever": knowledge_retriever,
+    "canvas_ip_velocity_tool": canvas_ip_velocity_tool,
+    "isolation_forest_scan_tool": isolation_forest_scan_tool,
+    "xgboost_fraud_train_tool": xgboost_fraud_train_tool,
     "analyze_chargeback_risk_tool": analyze_chargeback_risk_tool,
     "chargeback_trust_velocity_tool": chargeback_trust_velocity_tool,
     "build_representment_manifest_tool": build_representment_manifest_tool,
@@ -616,8 +694,12 @@ _TOOL_BY_NAME: dict[str, object] = {
 # Stable bind order: schema + filing first, then specialist tools.
 _ANALYST_TOOL_ORDER: tuple[str, ...] = (
     "get_dataset_schema",
+    "knowledge_retriever",
     "execute_in_sandbox",
     "emit_lead",
+    "canvas_ip_velocity_tool",
+    "isolation_forest_scan_tool",
+    "xgboost_fraud_train_tool",
     "chargeback_trust_velocity_tool",
     "analyze_chargeback_risk_tool",
     "build_representment_manifest_tool",

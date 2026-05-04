@@ -36,12 +36,36 @@ _WAREHOUSE_INTEL_TRIGGER = re.compile(
 
 _HUMANOID_TRIGGER = re.compile(r"\bhumanoid\b", re.I)
 
+# Methodology / prioritization without a concrete evidence request — avoid warehouse steering + tool spam.
+_PLANNING_ONLY_TRIGGER = re.compile(
+    r"\b("
+    r"hypothes(es|is)?\s+to\s+validate|hypothes(es|is)?\s+i\s+should|validate\s+first|"
+    r"top\s+\d+\s+hypothes|what\s+hypothes|hypothes(es|is)?\s+first|"
+    r"priorities?\s+for|methodology|what\s+should\s+i\s+(validate|check|test)\s+first"
+    r")\b",
+    re.I,
+)
+
 _USER_ID_PATTERNS = (
     re.compile(r"\buser[_\s]*id[\s:=]+['\"]?([^\s'\",)]+)", re.I),
     re.compile(r"\b(?:for|user)\s+['\"]?([uU]_[a-zA-Z0-9_\-:.]+)['\"]?", re.I),
     re.compile(r"\b([uU]_[a-zA-Z0-9_]{4,})\b"),
     re.compile(r"\b(?:account|acct)[_\s]*id[\s:=]+['\"]?([^\s'\",)]+)", re.I),
 )
+
+
+def _latest_human_text(messages: list[BaseMessage]) -> str:
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            return str(m.content or "")
+    return ""
+
+
+def _is_planning_only_message(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 16:
+        return False
+    return bool(_PLANNING_ONLY_TRIGGER.search(t))
 
 
 def extract_candidate_user_id_from_messages(messages: list[BaseMessage]) -> str | None:
@@ -63,6 +87,8 @@ def build_context_injection_messages(persona_id: str, messages: list[BaseMessage
     """Return system messages prepended after START (does not replace user content)."""
     pid = (persona_id or "").strip()
     out: list[SystemMessage] = []
+    last_human = _latest_human_text(messages)
+    planning_only = _is_planning_only_message(last_human)
 
     if pid == "ato_investigator":
         duck = duckdb_path_ctx.get()
@@ -170,7 +196,7 @@ def build_context_injection_messages(persona_id: str, messages: list[BaseMessage
 
     cid = case_id_ctx.get()
     dsp = dataset_path_ctx.get()
-    if cid and dsp and Path(dsp).is_file():
+    if cid and dsp and Path(dsp).is_file() and not planning_only:
         samples = sample_entities_from_case_csv(dsp)
         overlaps: list = []
         for et, val in list(samples.items())[:3]:
@@ -195,7 +221,7 @@ def build_context_injection_messages(persona_id: str, messages: list[BaseMessage
                 )
             )
 
-    if pid == "general":
+    if pid == "general" and not planning_only:
         for m in reversed(messages):
             if isinstance(m, HumanMessage):
                 t = str(m.content or "")

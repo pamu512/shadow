@@ -4,30 +4,25 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
 from backend.database import get_db
+from backend.database.dataset_path_resolve import resolve_with_active_fallback_async
 from backend.database.models import Case
 from backend.schemas import BotBulkSuspendRequest
 from backend.agent.tools_langchain import _try_emit_bot_hardware_lead
 from backend.tools.bot_detector import detect_bot_clusters
-from backend.tools.bulk_manager import batch_flag_accounts
+from backend.tools.bulk_manager import batch_flag_accounts_async
 
 router = APIRouter(prefix="/api/cases", tags=["bots"])
 
-# backend/api/routers/bots.py -> parents[3] == repository root (shadow/)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _resolve_case_csv_for_detection(case: Case) -> Path:
-    """
-    Resolve the on-disk CSV for bot detection.
-
-    Upload flow stores an absolute path, but older rows or different host cwd can leave paths that
-    only resolve from repo root, workspace, or the per-case datasets folder.
-    """
-    raw = (case.dataset_path or "").strip()
+def _resolve_case_csv_for_detection(case: Case, resolved_path: str) -> Path:
+    raw = (resolved_path or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="Case has no dataset_path; upload a CSV first.")
     p = Path(raw).expanduser()
@@ -55,26 +50,28 @@ def _resolve_case_csv_for_detection(case: Case) -> Path:
     return p
 
 
-def _get_case(case_id: str, db: Session) -> Case:
-    row = db.query(Case).filter(Case.id == case_id).first()
+async def _get_case(case_id: str, db: AsyncSession) -> Case:
+    r = await db.execute(select(Case).where(Case.id == case_id))
+    row = r.scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="Case not found")
     return row
 
 
 @router.post("/{case_id}/bots/detect")
-def bot_detect_clusters(case_id: str, db: Session = Depends(get_db)) -> dict:
-    case = _get_case(case_id, db)
-    csv_path = _resolve_case_csv_for_detection(case)
+async def bot_detect_clusters(case_id: str, db: AsyncSession = Depends(get_db)) -> dict:
+    case = await _get_case(case_id, db)
+    resolved = await resolve_with_active_fallback_async(db, case.dataset_path)
+    csv_path = _resolve_case_csv_for_detection(case, resolved or "")
     out = detect_bot_clusters(csv_path)
     _try_emit_bot_hardware_lead(case_id, out)
     return out
 
 
 @router.post("/{case_id}/bots/bulk-suspend")
-def bot_bulk_suspend(case_id: str, body: BotBulkSuspendRequest, db: Session = Depends(get_db)) -> dict:
-    _get_case(case_id, db)
-    return batch_flag_accounts(
+async def bot_bulk_suspend(case_id: str, body: BotBulkSuspendRequest, db: AsyncSession = Depends(get_db)) -> dict:
+    await _get_case(case_id, db)
+    return await batch_flag_accounts_async(
         db,
         case_id=case_id,
         account_ids=body.account_ids,

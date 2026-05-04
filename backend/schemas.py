@@ -70,6 +70,11 @@ class CaseCreate(BaseModel):
     name: str
     dataset_path: str | None = None
     status: CaseStatus = "INVESTIGATING"
+    tenant_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Logical tenant / org id for warehouse isolation (default: default).",
+    )
 
 
 class CasesPurgeOut(BaseModel):
@@ -88,8 +93,24 @@ class CasePatch(BaseModel):
         return self
 
 
+class CaseShareCreate(BaseModel):
+    """Grant ``viewer_case_id`` read access to this case's rows in the tenant warehouse."""
+
+    viewer_case_id: str = Field(..., min_length=1, max_length=64)
+
+
+class CaseShareOut(BaseModel):
+    id: int
+    owner_case_id: str
+    viewer_case_id: str
+
+    class Config:
+        from_attributes = True
+
+
 class CaseOut(BaseModel):
     id: str
+    tenant_id: str = "default"
     name: str
     dataset_path: str | None
     duckdb_path: str | None = None
@@ -211,6 +232,10 @@ class ChatRequest(BaseModel):
         default=None,
         description="Investigative lens id (e.g. chargeback_specialist). Defaults to general.",
     )
+    thread_id: str | None = Field(
+        default=None,
+        description="Stable id for LangGraph checkpointing across turns (rotate on new chat / case / persona).",
+    )
     thread_reset: bool = Field(
         default=False,
         description="When true, drop compiled LangGraph cache for this persona so tools/prompts reload; "
@@ -298,3 +323,23 @@ class OptimizeThresholdsResponse(BaseModel):
     optimization_manifest: dict[str, Any]
     metrics_at_threshold: dict[str, Any]
     optimization_objective: str
+
+
+class WorkbenchPinItem(BaseModel):
+    """Pinned forensic card (matches frontend PinnedForensicPayload)."""
+
+    id: str
+    title: str
+    subtitle: str = ""
+    payload: dict[str, Any] = Field(default_factory=dict)
+    pinned_at: int = Field(default=0, alias="pinnedAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class WorkbenchPinsPut(BaseModel):
+    pins: list[WorkbenchPinItem] = Field(default_factory=list, max_length=24)
+
+
+class WorkbenchPinsOut(BaseModel):
+    pins: list[dict[str, Any]]

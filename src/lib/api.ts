@@ -3,6 +3,7 @@ import type {
   CaseActivitySeries,
   CaseOut,
   CasesPurgeOut,
+  PinnedForensicPayload,
   CaseStatus,
   ChatApiResponse,
   ChatMessage,
@@ -15,7 +16,16 @@ import type {
   PersonaListItem,
 } from './types'
 
+/**
+ * API origin for fetch().
+ * - **Vite dev** (`import.meta.env.DEV`): empty string → same-origin URLs so requests go through the dev
+ *   server's proxy to the sidecar (avoids cross-origin / some WebView quirks vs direct :8742).
+ * - **Production** (preview / Tauri release): Tauri `get_api_base_url` or `VITE_API_BASE` / loopback default.
+ */
 export async function getApiBase(): Promise<string> {
+  if (import.meta.env.DEV) {
+    return ''
+  }
   try {
     return await invoke<string>('get_api_base_url')
   } catch {
@@ -23,17 +33,97 @@ export async function getApiBase(): Promise<string> {
   }
 }
 
-async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const base = (await getApiBase()).replace(/\/+$/, '')
-  const res = await fetch(`${base}${path}`, {
-    ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
-  })
-  if (!res.ok) {
-    const t = await res.text()
-    throw new Error(t || res.statusText)
+/** Desktop (Tauri) only: stops the bundled Python sidecar and starts a fresh uvicorn on the same port. */
+export async function restartShadowSidecar(): Promise<string> {
+  return await invoke<string>('restart_sidecar')
+}
+
+/** Prefer FastAPI `detail` (string or validation list) over raw JSON for errors. */
+function formatHttpErrorBody(statusText: string, raw: string): string {
+  const trimmed = (raw || '').trim()
+  if (!trimmed) return statusText || 'Request failed'
+  try {
+    const j = JSON.parse(trimmed) as unknown
+    if (j && typeof j === 'object' && !Array.isArray(j)) {
+      const rec = j as Record<string, unknown>
+      const d = rec.detail
+      if (typeof d === 'string' && d.trim()) return d.trim()
+      if (Array.isArray(d)) {
+        const parts = d
+          .map((x) => {
+            if (x && typeof x === 'object' && 'msg' in x && typeof (x as { msg: unknown }).msg === 'string') {
+              return (x as { msg: string }).msg
+            }
+            return null
+          })
+          .filter((s): s is string => Boolean(s))
+        if (parts.length) return parts.join('; ')
+      }
+    }
+  } catch {
+    /* not JSON */
   }
-  return res.json() as Promise<T>
+  return trimmed.length > 800 ? `${trimmed.slice(0, 800)}…` : trimmed
+}
+
+function alternateLoopbackApiBase(base: string): string | null {
+  if (!base) return null
+  try {
+    const u = new URL(base)
+    if (u.hostname === '127.0.0.1') {
+      u.hostname = 'localhost'
+      return u.origin.replace(/\/+$/, '')
+    }
+    if (u.hostname === 'localhost') {
+      u.hostname = '127.0.0.1'
+      return u.origin.replace(/\/+$/, '')
+    }
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const primary = (await getApiBase()).replace(/\/+$/, '')
+  const bases = [primary]
+  const alt = alternateLoopbackApiBase(primary)
+  if (alt && alt !== primary) bases.push(alt)
+
+  let lastNetworkErr: string | null = null
+  for (const base of bases) {
+    const url = `${base}${path}`
+    try {
+      const res = await fetch(url, {
+        ...init,
+        headers: { 'Content-Type': 'application/json', ...init?.headers },
+      })
+      if (!res.ok) {
+        const t = await res.text()
+        throw new Error(formatHttpErrorBody(res.statusText, t))
+      }
+      return res.json() as Promise<T>
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('could not reach')) throw e
+      const msg = e instanceof Error ? e.message : String(e)
+      const looksNetwork =
+        /load failed|failed to fetch|networkerror|ecconnrefused|aborted|not allowed/i.test(msg) ||
+        (e instanceof TypeError && /fetch/i.test(msg))
+      if (looksNetwork) {
+        lastNetworkErr = msg
+        continue
+      }
+      throw e
+    }
+  }
+  const tried = bases.filter(Boolean).join(' and ') || '(same-origin / proxied)'
+  const hint =
+    import.meta.env.DEV
+      ? 'Start the Python sidecar on port 8742 (e.g. from repo root: .venv/bin/python -m uvicorn backend.main:app --host 127.0.0.1 --port 8742 with PYTHONPATH set). Or run npm run tauri:dev. Optional: VITE_PROXY_TARGET if the API is not on 127.0.0.1:8742.'
+      : 'In the Shadow desktop app, use Restart API in the header. Otherwise run npm run tauri:dev or uvicorn on port 8742, or set VITE_API_BASE.'
+  throw new Error(
+    `${lastNetworkErr ?? 'Request failed'} — could not reach the API (${tried}). ${hint}`,
+  )
 }
 
 export const AGENT_INJECT_EVENT = 'shadow:agent-inject' as const
@@ -41,6 +131,10 @@ export const AGENT_INJECT_EVENT = 'shadow:agent-inject' as const
 export type AgentInjectDetail = { text: string; persona_id?: string | null }
 
 export async function getEvidenceWsUrl(caseId: string): Promise<string> {
+  if (import.meta.env.DEV) {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    return `${proto}//${window.location.host}/ws/cases/${encodeURIComponent(caseId)}/evidence`
+  }
   const base = await getApiBase()
   const u = new URL(base)
   u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -389,6 +483,7 @@ export async function sendChat(
   caseId?: string | null,
   personaId?: string | null,
   threadReset?: boolean,
+  threadId?: string | null,
 ): Promise<ChatApiResponse> {
   return apiFetch<ChatApiResponse>('/api/chat', {
     method: 'POST',
@@ -397,7 +492,19 @@ export async function sendChat(
       case_id: caseId ?? null,
       persona_id: personaId ?? null,
       thread_reset: Boolean(threadReset),
+      thread_id: threadId ?? null,
     }),
+  })
+}
+
+export async function fetchWorkbenchPins(caseId: string): Promise<{ pins: PinnedForensicPayload[] }> {
+  return apiFetch<{ pins: PinnedForensicPayload[] }>(`/api/cases/${caseId}/workbench-pins`)
+}
+
+export async function putWorkbenchPins(caseId: string, pins: PinnedForensicPayload[]): Promise<{ pins: PinnedForensicPayload[] }> {
+  return apiFetch<{ pins: PinnedForensicPayload[] }>(`/api/cases/${caseId}/workbench-pins`, {
+    method: 'PUT',
+    body: JSON.stringify({ pins }),
   })
 }
 

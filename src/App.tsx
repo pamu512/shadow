@@ -1,10 +1,14 @@
-import { useState } from 'react'
+import { toast } from 'sonner'
+import { useShadowStore } from './stores/shadowStore'
 import { ThreePaneLayout } from './components/layout/ThreePaneLayout'
 import { GhostButton, HealthPulsingDot } from './components/ui/ForensicChrome'
 import { ForensicModal } from './components/ui/ForensicModal'
-import { useApiHealth } from './hooks/useApiHealth'
-import { fetchHealth, fetchOllamaModelTags, patchLlmPreferences } from './lib/api'
+import { useHealthQuery } from './hooks/useHealthQuery'
+import { fetchHealth, fetchOllamaModelTags, patchLlmPreferences, restartShadowSidecar } from './lib/api'
 import type { CaseOut } from './lib/types'
+import { useState } from 'react'
+
+import { CommandPalette } from './components/ui/CommandPalette'
 
 function formatApiError(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e)
@@ -29,51 +33,69 @@ export default function App() {
     suggested: string
     notes: string
   } | null>(null)
-  const { apiBase, health, refresh } = useApiHealth()
-  const [llmSettingsOpen, setLlmSettingsOpen] = useState(false)
-  const [llmDraft, setLlmDraft] = useState('')
-  const [llmEnvDefault, setLlmEnvDefault] = useState('')
-  const [llmUsingOverride, setLlmUsingOverride] = useState(false)
-  const [llmErr, setLlmErr] = useState<string | null>(null)
-  const [llmBusy, setLlmBusy] = useState(false)
-  const [ollamaTags, setOllamaTags] = useState<string[]>([])
-  const [ollamaTagsHint, setOllamaTagsHint] = useState<string | null>(null)
+  const { apiBase, health, refresh } = useHealthQuery()
+  const llm = useShadowStore((s) => s.llm)
+  const setLlm = useShadowStore((s) => s.setLlm)
+
+  const onRestartApi = () => {
+    setLlm({ apiRestartBusy: true })
+    const promise = restartShadowSidecar().then(async (msg) => {
+      await refresh()
+      return msg
+    })
+    toast.promise(promise, {
+      loading: 'Restarting API...',
+      success: (msg) => msg,
+      error: (e) => (e instanceof Error ? e.message : String(e)),
+    })
+    promise.finally(() => setLlm({ apiRestartBusy: false }))
+  }
 
   const openLlmSettings = () => {
-    setLlmErr(null)
-    setOllamaTagsHint(null)
-    setOllamaTags([])
-    setLlmSettingsOpen(true)
+    setLlm({
+      err: null,
+      ollamaTagsHint: null,
+      ollamaTags: [],
+      open: true,
+    })
     void (async () => {
       try {
         const h = await fetchHealth()
-        setLlmDraft(h.ollama_model ?? '')
-        setLlmEnvDefault(h.ollama_env_default ?? h.ollama_model ?? '—')
-        setLlmUsingOverride(Boolean(h.ollama_using_override))
-        setLlmErr(null)
+        setLlm({
+          draft: h.ollama_model ?? '',
+          envDefault: h.ollama_env_default ?? h.ollama_model ?? '—',
+          usingOverride: Boolean(h.ollama_using_override),
+          err: null,
+        })
       } catch (e) {
-        setLlmErr(formatApiError(e))
-        setLlmDraft(health?.ollama_model ?? '')
-        setLlmEnvDefault(health?.ollama_env_default ?? '—')
-        setLlmUsingOverride(Boolean(health?.ollama_using_override))
+        setLlm({
+          err: formatApiError(e),
+          draft: health?.ollama_model ?? '',
+          envDefault: health?.ollama_env_default ?? '—',
+          usingOverride: Boolean(health?.ollama_using_override),
+        })
       }
       try {
         const tags = await fetchOllamaModelTags()
-        setOllamaTags(tags.models ?? [])
-        if (tags.error) {
-          setOllamaTagsHint(`Could not list models from Ollama: ${tags.error}. Type a tag manually (same as \`ollama list\`).`)
-        }
+        setLlm({
+          ollamaTags: tags.models ?? [],
+          ollamaTagsHint: tags.error
+            ? `Could not list models from Ollama: ${tags.error}. Type a tag manually (same as \`ollama list\`).`
+            : null,
+        })
       } catch {
-        setOllamaTags([])
-        setOllamaTagsHint(
-          'Installed-model picker unavailable (sidecar may need an update, or /ollama-models returned an error). Type a tag manually.',
-        )
+        setLlm({
+          ollamaTags: [],
+          ollamaTagsHint:
+            'Installed-model picker unavailable (sidecar may need an update, or /ollama-models returned an error). Type a tag manually.',
+        })
       }
     })()
   }
 
   return (
     <div className="flex h-screen min-h-0 flex-col bg-[#0d0d0d] text-zinc-100 antialiased">
+      <CommandPalette />
       <header className="relative flex h-12 shrink-0 items-center gap-6 border-b border-zinc-800/95 bg-[#0c0c0f]/95 px-4 backdrop-blur-md before:pointer-events-none before:absolute before:inset-0 before:bg-[linear-gradient(90deg,transparent,rgba(139,92,246,0.04)_45%,transparent)] before:content-['']">
         <div className="relative flex min-w-0 flex-col leading-tight">
           <div className="flex items-center gap-2">
@@ -102,7 +124,15 @@ export default function App() {
             {apiBase ?? '…'}
           </span>
         </div>
-        <div className="relative ml-auto flex shrink-0 items-center gap-2">
+        <div className="relative ml-auto flex shrink-0 flex-wrap items-center justify-end gap-2">
+          <GhostButton
+            onClick={() => onRestartApi()}
+            disabled={llm.apiRestartBusy}
+            className="!py-1 text-[11px]"
+            title="Stop and restart the bundled Python API (same port)"
+          >
+            {llm.apiRestartBusy ? 'Restarting…' : 'Restart API'}
+          </GhostButton>
           <GhostButton onClick={() => openLlmSettings()} className="!py-1 text-[11px]">
             Change model
           </GhostButton>
@@ -111,7 +141,10 @@ export default function App() {
           </GhostButton>
         </div>
       </header>
-      <ForensicModal open={llmSettingsOpen} onClose={() => setLlmSettingsOpen(false)} title="Change Ollama model">
+      <ForensicModal open={llm.open} onClose={() => setLlm({ open: false })} title="Change Ollama model">
+        <div className="mb-4 rounded-md border border-violet-500/30 bg-violet-500/10 px-3 py-2 text-xs text-violet-200">
+          <span className="font-semibold">Recommendation:</span> For optimal agentic reasoning and tool use, we recommend using <strong>qwen2.5:32b</strong> (if you have the RAM) or <strong>llama3.1:8b-instruct-fp16</strong>.
+        </div>
         <p className="text-xs leading-relaxed text-zinc-400">
           Pick or type the exact model tag Shadow should use for chat and tools (must exist in your local Ollama). This
           is saved under <span className="font-mono text-zinc-500">.data/preferences.json</span> and overrides{' '}
@@ -120,21 +153,21 @@ export default function App() {
         </p>
         <p className="mt-2 text-[11px] text-zinc-500">
           <span className="text-zinc-600">.env default:</span>{' '}
-          <span className="font-mono text-zinc-400">{llmEnvDefault || '…'}</span>
-          {llmUsingOverride ? (
+          <span className="font-mono text-zinc-400">{llm.envDefault || '…'}</span>
+          {llm.usingOverride ? (
             <span className="ml-2 text-amber-500/90">· using saved override</span>
           ) : (
             <span className="ml-2 text-zinc-600">· using .env default</span>
           )}
         </p>
-        {ollamaTagsHint ? <p className="mt-2 text-[11px] leading-snug text-amber-500/90">{ollamaTagsHint}</p> : null}
-        {llmErr ? <p className="mt-2 text-xs text-red-400">{llmErr}</p> : null}
+        {llm.ollamaTagsHint ? <p className="mt-2 text-[11px] leading-snug text-amber-500/90">{llm.ollamaTagsHint}</p> : null}
+        {llm.err ? <p className="mt-2 text-xs text-red-400">{llm.err}</p> : null}
         <label className="mt-3 block text-[10px] font-medium uppercase tracking-wider text-zinc-500">
           Model tag
           <input
             className="mt-1 w-full rounded-md border border-zinc-800 bg-zinc-950/80 px-2.5 py-2 font-mono text-xs text-zinc-200 placeholder:text-zinc-600 focus:border-violet-500/45 focus:outline-none"
-            value={llmDraft}
-            onChange={(e) => setLlmDraft(e.target.value)}
+            value={llm.draft}
+            onChange={(e) => setLlm({ draft: e.target.value })}
             list="shadow-ollama-model-datalist"
             placeholder="Type or pick from your installed models"
             spellCheck={false}
@@ -142,51 +175,51 @@ export default function App() {
           />
         </label>
         <datalist id="shadow-ollama-model-datalist">
-          {ollamaTags.map((m) => (
+          {llm.ollamaTags.map((m) => (
             <option key={m} value={m} />
           ))}
         </datalist>
         <div className="mt-4 flex flex-wrap gap-2">
           <button
             type="button"
-            disabled={llmBusy || !llmDraft.trim()}
+            disabled={llm.busy || !llm.draft.trim()}
             className="rounded-lg border border-emerald-500/45 bg-emerald-950/35 px-3 py-1.5 text-xs font-semibold text-emerald-100 hover:bg-emerald-900/40 disabled:opacity-40"
             onClick={() => {
-              setLlmBusy(true)
-              setLlmErr(null)
-              void (async () => {
-                try {
-                  await patchLlmPreferences({ ollama_model: llmDraft.trim() })
-                  await refresh()
-                  setLlmSettingsOpen(false)
-                } catch (e) {
-                  setLlmErr(formatApiError(e))
-                } finally {
-                  setLlmBusy(false)
-                }
-              })()
+              setLlm({ busy: true, err: null })
+              const promise = patchLlmPreferences({ ollama_model: llm.draft.trim() }).then(async () => {
+                await refresh()
+                setLlm({ open: false, busy: false })
+              })
+              toast.promise(promise, {
+                loading: 'Saving model preference...',
+                success: 'Model updated successfully',
+                error: (e) => {
+                  setLlm({ err: formatApiError(e), busy: false })
+                  return 'Failed to update model'
+                },
+              })
             }}
           >
-            {llmBusy ? 'Saving…' : 'Use this model'}
+            {llm.busy ? 'Saving…' : 'Use this model'}
           </button>
           <button
             type="button"
-            disabled={llmBusy || !llmUsingOverride}
+            disabled={llm.busy || !llm.usingOverride}
             className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-40"
             onClick={() => {
-              setLlmBusy(true)
-              setLlmErr(null)
-              void (async () => {
-                try {
-                  await patchLlmPreferences({ ollama_model: null })
-                  await refresh()
-                  setLlmSettingsOpen(false)
-                } catch (e) {
-                  setLlmErr(formatApiError(e))
-                } finally {
-                  setLlmBusy(false)
-                }
-              })()
+              setLlm({ busy: true, err: null })
+              const promise = patchLlmPreferences({ ollama_model: null }).then(async () => {
+                await refresh()
+                setLlm({ open: false, busy: false })
+              })
+              toast.promise(promise, {
+                loading: 'Reverting model preference...',
+                success: 'Reverted to .env default',
+                error: (e) => {
+                  setLlm({ err: formatApiError(e), busy: false })
+                  return 'Failed to revert model'
+                },
+              })
             }}
           >
             Revert to .env default

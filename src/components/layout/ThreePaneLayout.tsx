@@ -1,11 +1,14 @@
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import type { Dispatch, SetStateAction } from 'react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useState } from 'react'
+import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { WorkspaceDataProvider } from '../../context/WorkspaceDataContext'
 import { CaseFilesPanel } from '../sidebar/CaseFilesPanel'
 import { AgentConsole } from '../console/AgentConsole'
-import type { PinnedForensicPayload } from '../console/ForensicResultTranscriptCard'
+import type { PinnedForensicPayload } from '../../lib/types'
 import { WorkspaceViewer } from '../viewer/WorkspaceViewer'
 import type { CaseOut } from '../../lib/types'
+import { fetchWorkbenchPins, putWorkbenchPins } from '../../lib/api'
 
 type LayoutProps = {
   activeCase: CaseOut | null
@@ -17,12 +20,6 @@ type LayoutProps = {
 const paneChrome =
   'relative min-h-0 bg-[#0d0d0d] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] before:pointer-events-none before:absolute before:left-0 before:top-0 before:bottom-0 before:w-px before:bg-zinc-800/90 before:content-[\'\'] after:pointer-events-none after:absolute after:right-0 after:top-0 after:bottom-0 after:w-px after:bg-black/40 after:content-[\'\']'
 
-const LEGACY_PINNED_KEY = 'shadow:pinned-forensics-v1'
-const CASE_PINNED_KEY = 'shadow:pinned-forensics-by-case-v1'
-const MIGRATED_FLAG = 'shadow:pinned-forensics-migrated-v1'
-
-type PinStore = Record<string, PinnedForensicPayload[]>
-
 function isPinnedPayload(x: unknown): x is PinnedForensicPayload {
   return Boolean(
     x &&
@@ -32,123 +29,66 @@ function isPinnedPayload(x: unknown): x is PinnedForensicPayload {
   )
 }
 
-function readPinStore(): PinStore {
-  try {
-    const raw = sessionStorage.getItem(CASE_PINNED_KEY)
-    if (!raw) return {}
-    const parsed = JSON.parse(raw) as unknown
-    if (!parsed || typeof parsed !== 'object') return {}
-    const out: PinStore = {}
-    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      if (!Array.isArray(v)) continue
-      const cleaned = v.filter(isPinnedPayload).slice(0, 12)
-      if (cleaned.length) out[k] = cleaned
-    }
-    return out
-  } catch {
-    return {}
-  }
-}
-
-function writePinStore(store: PinStore) {
-  try {
-    sessionStorage.setItem(CASE_PINNED_KEY, JSON.stringify(store))
-  } catch {
-    /* ignore */
-  }
-}
-
-function migrateLegacyPinsIfNeeded(): void {
-  try {
-    if (sessionStorage.getItem(MIGRATED_FLAG)) return
-    const legacyRaw = sessionStorage.getItem(LEGACY_PINNED_KEY)
-    if (!legacyRaw) {
-      sessionStorage.setItem(MIGRATED_FLAG, '1')
-      return
-    }
-    const parsed = JSON.parse(legacyRaw) as unknown
-    const arr = Array.isArray(parsed) ? parsed.filter(isPinnedPayload).slice(0, 12) : []
-    const store = readPinStore()
-    if (arr.length && !store.__legacy__) {
-      store.__legacy__ = arr
-      writePinStore(store)
-    }
-    sessionStorage.removeItem(LEGACY_PINNED_KEY)
-    sessionStorage.setItem(MIGRATED_FLAG, '1')
-  } catch {
-    sessionStorage.setItem(MIGRATED_FLAG, '1')
-  }
-}
-
-function pinsForCase(caseId: string, store: PinStore): PinnedForensicPayload[] {
-  const direct = store[caseId]
-  if (direct?.length) return direct
-  const leg = store.__legacy__
-  if (leg?.length) {
-    const next = { ...store, [caseId]: leg }
-    delete next.__legacy__
-    writePinStore(next)
-    return leg
-  }
-  return []
-}
-
 export function ThreePaneLayout({ activeCase, setActiveCase, review, setReview }: LayoutProps) {
   const [agentPersonaId, setAgentPersonaId] = useState('general')
-  const [pinnedForensics, setPinnedForensics] = useState<PinnedForensicPayload[]>([])
-  const activeCaseIdRef = useRef<string | null>(null)
-  activeCaseIdRef.current = activeCase?.id ?? null
+  const queryClient = useQueryClient()
 
-  useEffect(() => {
-    migrateLegacyPinsIfNeeded()
-  }, [])
+  const { data: pinsData } = useQuery({
+    queryKey: ['workbenchPins', activeCase?.id],
+    queryFn: async () => {
+      if (!activeCase?.id) return { pins: [] }
+      const res = await fetchWorkbenchPins(activeCase.id)
+      const raw = Array.isArray(res.pins) ? res.pins : []
+      return { pins: raw.filter(isPinnedPayload).slice(0, 12) }
+    },
+    enabled: !!activeCase?.id,
+  })
 
-  useEffect(() => {
-    const id = activeCase?.id ?? null
-    if (!id) {
-      setPinnedForensics([])
-      return
-    }
-    setPinnedForensics(pinsForCase(id, readPinStore()))
-  }, [activeCase?.id])
+  const pinnedForensics = pinsData?.pins ?? []
 
-  const persistPinsForActiveCase = useCallback((next: PinnedForensicPayload[]) => {
-    const cid = activeCaseIdRef.current
-    if (!cid) return
-    const store = readPinStore()
-    store[cid] = next
-    writePinStore(store)
-  }, [])
+  const updatePinsMutation = useMutation({
+    mutationFn: async (next: PinnedForensicPayload[]) => {
+      if (!activeCase?.id) return { pins: [] }
+      return putWorkbenchPins(activeCase.id, next)
+    },
+    onMutate: async (next) => {
+      if (!activeCase?.id) return
+      await queryClient.cancelQueries({ queryKey: ['workbenchPins', activeCase.id] })
+      const previous = queryClient.getQueryData(['workbenchPins', activeCase.id])
+      queryClient.setQueryData(['workbenchPins', activeCase.id], { pins: next })
+      return { previous }
+    },
+    onError: (_err, _next, context) => {
+      if (activeCase?.id && context?.previous) {
+        queryClient.setQueryData(['workbenchPins', activeCase.id], context.previous)
+      }
+    },
+  })
 
   const onPinForensic = useCallback(
     (item: PinnedForensicPayload) => {
-      setPinnedForensics((p) => {
-        const merged = [item, ...p].filter((x, i, a) => a.findIndex((y) => y.id === x.id) === i).slice(0, 12)
-        persistPinsForActiveCase(merged)
-        return merged
-      })
+      const merged = [item, ...pinnedForensics].filter((x, i, a) => a.findIndex((y) => y.id === x.id) === i).slice(0, 12)
+      updatePinsMutation.mutate(merged)
     },
-    [persistPinsForActiveCase],
+    [pinnedForensics, updatePinsMutation],
   )
 
   const onUnpinForensic = useCallback(
     (id: string) => {
-      setPinnedForensics((p) => {
-        const merged = p.filter((x) => x.id !== id)
-        persistPinsForActiveCase(merged)
-        return merged
-      })
+      const merged = pinnedForensics.filter((x) => x.id !== id)
+      updatePinsMutation.mutate(merged)
     },
-    [persistPinsForActiveCase],
+    [pinnedForensics, updatePinsMutation],
   )
 
   return (
     <WorkspaceDataProvider>
-      <div className="grid h-full w-full min-h-0 grid-cols-[minmax(272px,1fr)_1.85fr_minmax(320px,1.15fr)] gap-px bg-[#0d0d0d]">
-        <div className={paneChrome}>
+      <PanelGroup direction="horizontal" className="h-full w-full min-h-0 bg-[#0d0d0d]">
+        <Panel defaultSize={20} minSize={15} className={paneChrome}>
           <CaseFilesPanel activeId={activeCase?.id ?? null} onActiveChange={setActiveCase} />
-        </div>
-        <div className={`${paneChrome} border-x border-zinc-900/80 flex min-h-0 min-w-0`}>
+        </Panel>
+        <PanelResizeHandle className="w-1 bg-zinc-900/80 hover:bg-violet-500/50 transition-colors cursor-col-resize z-10" />
+        <Panel defaultSize={40} minSize={25} className={`${paneChrome} flex min-h-0 min-w-0`}>
           <div className="flex min-h-0 min-w-0 flex-1 flex-col">
             <AgentConsole
               activeCase={activeCase}
@@ -157,8 +97,9 @@ export function ThreePaneLayout({ activeCase, setActiveCase, review, setReview }
               onPinForensic={onPinForensic}
             />
           </div>
-        </div>
-        <div className={paneChrome}>
+        </Panel>
+        <PanelResizeHandle className="w-1 bg-zinc-900/80 hover:bg-violet-500/50 transition-colors cursor-col-resize z-10" />
+        <Panel defaultSize={40} minSize={25} className={paneChrome}>
           <WorkspaceViewer
             activeCase={activeCase}
             review={review}
@@ -167,8 +108,8 @@ export function ThreePaneLayout({ activeCase, setActiveCase, review, setReview }
             workbenchPins={pinnedForensics}
             onWorkbenchUnpin={onUnpinForensic}
           />
-        </div>
-      </div>
+        </Panel>
+      </PanelGroup>
     </WorkspaceDataProvider>
   )
 }

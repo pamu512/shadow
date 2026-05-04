@@ -11,7 +11,10 @@ import duckdb
 import polars as pl
 
 from backend.config import settings
-from backend.database.ingestion import _configure_duckdb
+from backend.data.tenant_constants import DEFAULT_TENANT_ID
+from backend.data.warehouse_paths import tenant_warehouse_path
+from backend.database.duckdb_lock import duckdb_lock_path
+from backend.database.ingestion import _configure_duckdb, read_csv_to_polars
 from backend.tools.entity_columns import extract_entities_from_row
 
 
@@ -26,8 +29,12 @@ class GlobalWarehouse:
     ``upload_timestamp``. ``entity_map`` aggregates distinct cases per entity.
     """
 
-    def __init__(self, db_path: Path | None = None) -> None:
-        self.db_path = Path(db_path or settings.global_warehouse_db_path)
+    def __init__(self, db_path: Path | None = None, tenant_id: str | None = None) -> None:
+        if db_path is not None:
+            self.db_path = Path(db_path)
+        else:
+            tid = (tenant_id or DEFAULT_TENANT_ID).strip() or DEFAULT_TENANT_ID
+            self.db_path = Path(tenant_warehouse_path(settings.data_dir, tid))
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,7 +105,7 @@ class GlobalWarehouse:
         fname = Path(original_filename).name[:512]
 
         try:
-            df = pl.read_csv(path, infer_schema_length=50_000, try_parse_dates=True)
+            df = read_csv_to_polars(path)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"Failed to read CSV: {exc}"}
 
@@ -123,35 +130,36 @@ class GlobalWarehouse:
             for et, val, scol in extract_entities_from_row(row):
                 entity_rows.append((cid, upload_ts, et, val, scol))
 
-        con = self._connect()
-        try:
-            self.ensure_schema(con)
-            ev_chunk = 2000
-            for i in range(0, len(event_rows), ev_chunk):
-                part = event_rows[i : i + ev_chunk]
-                con.executemany(
-                    """
-                    INSERT INTO warehouse_events
-                    (source_case_id, upload_timestamp, source_filename, row_index, row_json)
-                    VALUES (?, ?, ?, ?, ?);
-                    """,
-                    part,
-                )
-            if entity_rows:
-                chunk = 8000
-                for i in range(0, len(entity_rows), chunk):
-                    part = entity_rows[i : i + chunk]
+        with duckdb_lock_path(self.db_path):
+            con = self._connect()
+            try:
+                self.ensure_schema(con)
+                ev_chunk = 2000
+                for i in range(0, len(event_rows), ev_chunk):
+                    part = event_rows[i : i + ev_chunk]
                     con.executemany(
                         """
-                        INSERT INTO entity_occurrences
-                        (source_case_id, upload_timestamp, entity_type, entity_value, source_column)
+                        INSERT INTO warehouse_events
+                        (source_case_id, upload_timestamp, source_filename, row_index, row_json)
                         VALUES (?, ?, ?, ?, ?);
                         """,
                         part,
                     )
-            self.rebuild_entity_map(con)
-        finally:
-            con.close()
+                if entity_rows:
+                    chunk = 8000
+                    for i in range(0, len(entity_rows), chunk):
+                        part = entity_rows[i : i + chunk]
+                        con.executemany(
+                            """
+                            INSERT INTO entity_occurrences
+                            (source_case_id, upload_timestamp, entity_type, entity_value, source_column)
+                            VALUES (?, ?, ?, ?, ?);
+                            """,
+                            part,
+                        )
+                self.rebuild_entity_map(con)
+            finally:
+                con.close()
 
         return {
             "ok": True,
@@ -169,12 +177,13 @@ class GlobalWarehouse:
             return {"ok": False, "error": "case_id required"}
         if not self.db_path.is_file():
             return {"ok": True, "removed": False, "note": "warehouse file not present"}
-        con = self._connect()
-        try:
-            self.ensure_schema(con)
-            con.execute("DELETE FROM warehouse_events WHERE source_case_id = ?", [cid])
-            con.execute("DELETE FROM entity_occurrences WHERE source_case_id = ?", [cid])
-            self.rebuild_entity_map(con)
-        finally:
-            con.close()
+        with duckdb_lock_path(self.db_path):
+            con = self._connect()
+            try:
+                self.ensure_schema(con)
+                con.execute("DELETE FROM warehouse_events WHERE source_case_id = ?", [cid])
+                con.execute("DELETE FROM entity_occurrences WHERE source_case_id = ?", [cid])
+                self.rebuild_entity_map(con)
+            finally:
+                con.close()
         return {"ok": True, "removed": True, "source_case_id": cid}

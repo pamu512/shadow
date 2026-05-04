@@ -3,15 +3,22 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from backend.agents.registry import get_fraud_agent
 from backend.agent.coordinator import resolve_persona_id
 from backend.config import settings
+from backend.data.tenant_constants import DEFAULT_TENANT_ID
+from backend.database.models import Case
+from backend.database.session import SessionLocal
 from backend.schemas import ChatMessage
+from backend.tools.warehouse_query import clear_warehouse_query_context, set_warehouse_query_context
 
 from .graph import get_compiled_graph, invalidate_compiled_graph_cache
+from .ollama import get_llm
+from .tool_confidence import infer_tool_confidence_score
 from .tool_self_heal import strip_traceback_for_agent_ui
 from .tools_langchain import set_agent_context
 
@@ -31,6 +38,7 @@ def _to_lc(messages: list[ChatMessage]) -> list[BaseMessage]:
 
 
 def _from_lc(messages: list[BaseMessage]) -> list[ChatMessage]:
+    """Map LangGraph state to API chat lines. Omit SystemMessage: those are model-only (ReAct prompt + context injection)."""
     out: list[ChatMessage] = []
     for m in messages:
         if isinstance(m, HumanMessage):
@@ -38,7 +46,7 @@ def _from_lc(messages: list[BaseMessage]) -> list[ChatMessage]:
         elif isinstance(m, AIMessage):
             out.append(ChatMessage(role="assistant", content=str(m.content)))
         elif isinstance(m, SystemMessage):
-            out.append(ChatMessage(role="system", content=str(m.content)))
+            continue
         elif isinstance(m, ToolMessage):
             safe = strip_traceback_for_agent_ui(str(m.content))
             out.append(ChatMessage(role="assistant", content=f"[tool {m.name}] {safe}"))
@@ -47,67 +55,7 @@ def _from_lc(messages: list[BaseMessage]) -> list[ChatMessage]:
     return out
 
 
-def _infer_confidence_from_tool_payload(data: dict, tool_name: str) -> float:
-    if isinstance(data.get("confidence_score"), (int, float)):
-        return max(0.0, min(1.0, float(data["confidence_score"])))
-    if tool_name == "analyze_chargeback_risk_tool":
-        wp = data.get("win_probability")
-        if isinstance(wp, (int, float)):
-            return max(0.0, min(1.0, float(wp)))
-        wpp = data.get("win_probability_percent")
-        if isinstance(wpp, (int, float)):
-            return max(0.0, min(1.0, float(wpp) / 100.0))
-        scr = data.get("chargeback_risk_score")
-        if isinstance(scr, (int, float)):
-            return max(0.0, min(1.0, float(scr) / 100.0))
-    if tool_name == "analyze_ato_risk_tool":
-        safety = data.get("safety_score")
-        risk = data.get("ato_risk_score")
-        if isinstance(safety, (int, float)):
-            return max(0.0, min(1.0, float(safety) / 100.0))
-        if isinstance(risk, (int, float)):
-            return max(0.0, min(1.0, 1.0 - float(risk) / 100.0))
-    if tool_name == "detect_bot_clusters_tool":
-        bd = data.get("bot_density_pct")
-        if isinstance(bd, (int, float)):
-            return max(0.0, min(1.0, 0.42 + float(bd) / 180.0))
-    if tool_name == "find_fraud_rings_tool":
-        gs = data.get("graph_summary")
-        if isinstance(gs, dict):
-            edges = gs.get("edges")
-            if isinstance(edges, int) and edges > 0:
-                return max(0.0, min(1.0, 0.52 + min(edges, 80) * 0.005))
-        mh = data.get("multi_hop_scan")
-        if isinstance(mh, dict) and mh.get("three_hop_narrative_ready"):
-            return 0.68
-    if tool_name == "build_user_behavioral_profile_tool" and data.get("ok") is True:
-        n = data.get("historical_event_count")
-        if isinstance(n, int) and n >= 5:
-            return 0.78
-        if isinstance(n, int) and n > 0:
-            return 0.62
-    if tool_name == "chargeback_trust_velocity_tool":
-        if data.get("seasoning_assessment"):
-            return 0.88
-        rs = data.get("risk_score")
-        if isinstance(rs, (int, float)):
-            return max(0.0, min(1.0, float(rs) / 100.0))
-        return 0.72
-    if tool_name == "search_historical_overlap_tool":
-        if data.get("recidivist_fraudster"):
-            return 0.9
-        oc = data.get("other_case_count_excluding_active")
-        if isinstance(oc, int) and oc > 0:
-            return max(0.0, min(1.0, 0.55 + min(6, oc) * 0.05))
-        return 0.56
-    if tool_name == "humanoid_stress_test_linkage_tool" and data.get("global_hits"):
-        return 0.84
-    if tool_name == "humanoid_stress_test_linkage_tool":
-        return 0.58
-    return 0.72
-
-
-def _enrich_tool_line(content: str, agent_type: str) -> str:
+def _enrich_tool_line(content: str, agent_type: str, llm) -> str:
     m = _TOOL_LINE_RE.match(content.strip())
     if not m:
         return content
@@ -121,11 +69,11 @@ def _enrich_tool_line(content: str, agent_type: str) -> str:
     if "agent_type" not in data:
         data["agent_type"] = agent_type
     if "confidence_score" not in data:
-        data["confidence_score"] = _infer_confidence_from_tool_payload(data, name)
+        data["confidence_score"] = infer_tool_confidence_score(llm, name, data)
     return f"[tool {name}] {json.dumps(data, default=str)}"
 
 
-def _min_confidence_in_last_turn(msgs: list[ChatMessage]) -> tuple[float | None, str | None]:
+def _min_confidence_in_last_turn(msgs: list[ChatMessage], llm) -> tuple[float | None, str | None]:
     """Minimum inferred confidence among tool payloads after the last user message."""
     block: list[ChatMessage] = []
     for m in reversed(msgs):
@@ -148,7 +96,7 @@ def _min_confidence_in_last_turn(msgs: list[ChatMessage]) -> tuple[float | None,
             continue
         c = data.get("confidence_score")
         if not isinstance(c, (int, float)):
-            c = _infer_confidence_from_tool_payload(data, name)
+            c = infer_tool_confidence_score(llm, name, data)
         c = float(c)
         if min_c is None or c < min_c:
             min_c = c
@@ -160,13 +108,14 @@ def _apply_agent_enrichment_and_rfi(msgs: list[ChatMessage], persona_id: str) ->
     fa = get_fraud_agent(persona_id)
     at = fa.agent_type
     thr = float(fa.confidence_threshold)
+    llm = get_llm()
     out: list[ChatMessage] = []
     for m in msgs:
         if m.role == "assistant":
-            out.append(ChatMessage(role="assistant", content=_enrich_tool_line(m.content, at)))
+            out.append(ChatMessage(role="assistant", content=_enrich_tool_line(m.content, at, llm)))
         else:
             out.append(m)
-    min_c, tool_name = _min_confidence_in_last_turn(out)
+    min_c, tool_name = _min_confidence_in_last_turn(out, llm)
     if min_c is not None and min_c < thr:
         out.append(
             ChatMessage(
@@ -190,6 +139,34 @@ def _apply_agent_enrichment_and_rfi(msgs: list[ChatMessage], persona_id: str) ->
     return out
 
 
+def _stable_thread_id(case_id: str | None, persona_id: str, client_thread_id: str | None) -> str:
+    base = (client_thread_id or "").strip() or uuid.uuid4().hex
+    cid = (case_id or "nocase").strip()
+    return f"{cid}:{persona_id}:{base}"
+
+
+def _messages_for_checkpoint_invoke(
+    graph,
+    config: dict,
+    full_lc: list[BaseMessage],
+) -> tuple[list[BaseMessage], bool]:
+    """Return (messages_input, skip_invoke). Delta vs checkpoint so add_messages does not duplicate."""
+    try:
+        snap = graph.get_state(config)
+        existing = list((snap.values or {}).get("messages") or [])
+    except Exception:
+        return full_lc, False
+    n, m = len(existing), len(full_lc)
+    if n == 0:
+        return full_lc, False
+    if m < n:
+        # Client shorter than checkpoint — rotate thread_id client-side; still send full payload once.
+        return full_lc, False
+    if m > n:
+        return full_lc[n:], False
+    return [], True
+
+
 def invoke_chat(
     messages: list[ChatMessage],
     *,
@@ -198,16 +175,48 @@ def invoke_chat(
     duckdb_path: str | None = None,
     persona_id: str | None = None,
     thread_reset: bool = False,
+    thread_id: str | None = None,
 ) -> tuple[list[ChatMessage], dict | None]:
-    set_agent_context(case_id=case_id, dataset_path=dataset_path, duckdb_path=duckdb_path)
-    pid = resolve_persona_id(persona_id)
-    if thread_reset:
-        invalidate_compiled_graph_cache(pid)
-    graph = get_compiled_graph(pid)
-    state = graph.invoke({"messages": _to_lc(messages), "next_agent": "analyst"})
-    raw_msgs = _from_lc(state["messages"])
-    enriched = _apply_agent_enrichment_and_rfi(raw_msgs, pid)
-    debug = None
-    if settings.debug_agent:
-        debug = {"next_agent": state.get("next_agent"), "persona_id": pid, "thread_reset": thread_reset}
-    return enriched, debug
+    tid = DEFAULT_TENANT_ID
+    if case_id:
+        dbs = SessionLocal()
+        try:
+            row = dbs.query(Case).filter(Case.id == case_id).first()
+            if row and getattr(row, "tenant_id", None):
+                tid = str(row.tenant_id).strip() or DEFAULT_TENANT_ID
+        finally:
+            dbs.close()
+    set_warehouse_query_context(tenant_id=tid, viewer_case_id=case_id)
+    try:
+        set_agent_context(case_id=case_id, dataset_path=dataset_path, duckdb_path=duckdb_path)
+        pid = resolve_persona_id(persona_id)
+        if thread_reset:
+            invalidate_compiled_graph_cache(pid)
+        graph = get_compiled_graph(pid)
+        tid_graph = _stable_thread_id(case_id, pid, thread_id)
+        config: dict = {"configurable": {"thread_id": tid_graph}}
+        full_lc = _to_lc(messages)
+        delta, skip_invoke = _messages_for_checkpoint_invoke(graph, config, full_lc)
+        if skip_invoke:
+            snap = graph.get_state(config)
+            state_msgs = list((snap.values or {}).get("messages") or [])
+            raw_msgs = _from_lc(state_msgs)
+        else:
+            _ = graph.invoke({"messages": delta, "next_agent": "analyst"}, config)
+            snap = graph.get_state(config)
+            state_msgs = list((snap.values or {}).get("messages") or [])
+            raw_msgs = _from_lc(state_msgs)
+        enriched = _apply_agent_enrichment_and_rfi(raw_msgs, pid)
+        debug = None
+        if settings.debug_agent:
+            vals = (snap.values or {}) if snap else {}
+            debug = {
+                "next_agent": vals.get("next_agent"),
+                "persona_id": pid,
+                "thread_reset": thread_reset,
+                "thread_id": tid_graph,
+                "checkpoint_skip": skip_invoke,
+            }
+        return enriched, debug
+    finally:
+        clear_warehouse_query_context()

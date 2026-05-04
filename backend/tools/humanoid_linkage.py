@@ -6,6 +6,9 @@ from typing import Any
 
 import polars as pl
 
+from backend.data.tenant_constants import DEFAULT_TENANT_ID
+from backend.data.warehouse_access import tenant_id_for_case
+from backend.database.session import SessionLocal
 from backend.tools.entity_columns import extract_entities_from_row
 from backend.tools.global_search import _build_global_linkage, _case_meta, search_historical_overlap
 from backend.tools.warehouse_query import run_warehouse_query
@@ -58,6 +61,14 @@ def run_humanoid_stress_test_linkage(
     canvas_val = _first_canvas_value(path) if path else None
     current_ip = samples.get("ip_address")
 
+    tenant_id = DEFAULT_TENANT_ID
+    if cid:
+        db_acl = SessionLocal()
+        try:
+            tenant_id = tenant_id_for_case(db_acl, cid)
+        finally:
+            db_acl.close()
+
     humanoid_sql = """
         SELECT DISTINCT source_case_id, source_filename, upload_timestamp
         FROM warehouse_events
@@ -69,7 +80,7 @@ def run_humanoid_stress_test_linkage(
         ORDER BY upload_timestamp ASC
         LIMIT 60
     """
-    humanoid_rows = run_warehouse_query(humanoid_sql)
+    humanoid_rows = run_warehouse_query(humanoid_sql, tenant_id=tenant_id, viewer_case_id=cid)
     probe_case_ids: list[str] = []
     if humanoid_rows.get("ok") and isinstance(humanoid_rows.get("rows"), list):
         for r in humanoid_rows["rows"]:
@@ -77,10 +88,22 @@ def run_humanoid_stress_test_linkage(
             if sc and str(sc) not in probe_case_ids:
                 probe_case_ids.append(str(sc))
 
-    overlap_stress = search_historical_overlap(STRESS_IP, "ip_address", exclude_case_id=cid)
+    overlap_stress = search_historical_overlap(
+        STRESS_IP,
+        "ip_address",
+        exclude_case_id=cid,
+        tenant_id=tenant_id,
+        viewer_case_id=cid,
+    )
     overlap_canvas: dict[str, Any] | None = None
     if canvas_val:
-        overlap_canvas = search_historical_overlap(canvas_val, "device_id", exclude_case_id=cid)
+        overlap_canvas = search_historical_overlap(
+            canvas_val,
+            "device_id",
+            exclude_case_id=cid,
+            tenant_id=tenant_id,
+            viewer_case_id=cid,
+        )
 
     primary_overlap = overlap_stress if overlap_stress.get("other_cases") else overlap_canvas or overlap_stress
     other_cases = list(primary_overlap.get("other_cases") or [])

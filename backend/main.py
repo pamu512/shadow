@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -23,18 +24,35 @@ from backend.api.routers import (
     thresholds,
     warehouse,
 )
-from backend.database import Base, engine, ensure_sqlite_migrations
+from backend.database import init_db_schema_async
+from backend.rag.knowledge_store import ensure_ingested
 from backend.realtime.evidence_hub import EvidenceHub, run_evidence_event_pump
+
+
+def _ensure_backend_logging() -> None:
+    """Attach a stderr handler so router `logger.exception` lines appear beside uvicorn access logs."""
+    log = logging.getLogger("backend")
+    if log.handlers:
+        return
+    h = logging.StreamHandler()
+    h.setLevel(logging.INFO)
+    h.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    log.setLevel(logging.INFO)
+    log.addHandler(h)
+    log.propagate = False
+
+
+_ensure_backend_logging()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    ensure_sqlite_migrations()
+    await init_db_schema_async()
     hub = EvidenceHub()
     app.state.evidence_hub = hub
     pump = asyncio.create_task(run_evidence_event_pump(hub))
     try:
+        ensure_ingested()
         yield
     finally:
         pump.cancel()
@@ -51,6 +69,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:1420",
+        "http://127.0.0.1:1420",
         "tauri://localhost",
         "https://tauri.localhost",
     ],

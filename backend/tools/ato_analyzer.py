@@ -9,8 +9,11 @@ from typing import Any
 
 import duckdb
 
+from backend.database.duckdb_lock import duckdb_lock_path
 from backend.database.ingestion import _configure_duckdb
+from backend.tools.amount_input import normalize_mapping_amount_fields
 from backend.tools.ato_columns import fetch_column_names, quote_ident, resolve_ato_columns
+from backend.tools.fingerprint_velocity import analyze_canvas_ip_velocity
 from backend.tools.user_profiler import build_user_behavioral_profile
 
 _HOSTING_RE = re.compile(
@@ -149,36 +152,40 @@ def infer_user_id_from_duckdb(
     path = Path(duckdb_path)
     if not path.is_file():
         return None, None, {"error": f"DuckDB not found: {path}"}
-    con = duckdb.connect(str(path), read_only=True)
-    try:
+    with duckdb_lock_path(path):
+        con = duckdb.connect(str(path), read_only=True)
         try:
-            _configure_duckdb(con)
-        except Exception:  # noqa: BLE001
-            pass
-        cols = resolve_ato_columns(con, table)
-        uc = (user_column or "").strip() or cols.get("user_id")
-        names = fetch_column_names(con, table)
-        if not uc or uc not in names:
-            return None, None, {
-                "error": "Could not resolve a user / account id column (looked for user_id, acc_id, customer_id, …).",
-                "columns": names,
-            }
-        uq, tq = quote_ident(uc), quote_ident(table)
-        row = con.sql(
-            f"""
-            SELECT CAST({uq} AS VARCHAR) AS uid, COUNT(*) AS n
-            FROM {tq}
-            WHERE {uq} IS NOT NULL AND TRIM(CAST({uq} AS VARCHAR)) <> ''
-            GROUP BY 1
-            ORDER BY n DESC
-            LIMIT 1
-            """,
-        ).fetchone()
-        if not row or not row[0]:
-            return None, uc, {"error": "Dataset has no non-null user identifiers in the resolved column.", "column": uc}
-        return str(row[0]).strip(), uc, {"inferred_rank_count": int(row[1])}
-    finally:
-        con.close()
+            try:
+                _configure_duckdb(con)
+            except Exception:  # noqa: BLE001
+                pass
+            cols = resolve_ato_columns(con, table)
+            uc = (user_column or "").strip() or cols.get("user_id")
+            names = fetch_column_names(con, table)
+            if not uc or uc not in names:
+                return None, None, {
+                    "error": "Could not resolve a user / account id column (looked for user_id, acc_id, customer_id, …).",
+                    "columns": names,
+                }
+            uq, tq = quote_ident(uc), quote_ident(table)
+            row = con.sql(
+                f"""
+                SELECT CAST({uq} AS VARCHAR) AS uid, COUNT(*) AS n
+                FROM {tq}
+                WHERE {uq} IS NOT NULL AND TRIM(CAST({uq} AS VARCHAR)) <> ''
+                GROUP BY 1
+                ORDER BY n DESC
+                LIMIT 1
+                """,
+            ).fetchone()
+            if not row or not row[0]:
+                return None, uc, {
+                    "error": "Dataset has no non-null user identifiers in the resolved column.",
+                    "column": uc,
+                }
+            return str(row[0]).strip(), uc, {"inferred_rank_count": int(row[1])}
+        finally:
+            con.close()
 
 
 _FLAG_PUBLIC_LABELS: dict[str, str] = {
@@ -219,6 +226,8 @@ def analyze_ato_risk(
     if not isinstance(current_session_data, dict):
         return {"ok": False, "error": "current_session_data must be an object."}
 
+    current_session_data = normalize_mapping_amount_fields(dict(current_session_data))
+
     uid = str(user_id).strip()
     user_id_source: str = "explicit"
     inferred_user_column: str | None = None
@@ -255,165 +264,168 @@ def analyze_ato_risk(
     discrepancies: list[dict[str, Any]] = []
     travel_map: dict[str, Any] | None = None
 
-    con = duckdb.connect(str(path), read_only=True)
-    try:
+    with duckdb_lock_path(path):
+        con = duckdb.connect(str(path), read_only=True)
         try:
-            _configure_duckdb(con)
-        except Exception:  # noqa: BLE001
-            pass
-        cols = resolve_ato_columns(con, table)
-        uc = effective_user_column or cols.get("user_id")
-        if not uc or uc not in fetch_column_names(con, table):
-            return {"ok": False, "error": "User column unresolved.", "profile": profile}
+            try:
+                _configure_duckdb(con)
+            except Exception:  # noqa: BLE001
+                pass
+            cols = resolve_ato_columns(con, table)
+            uc = effective_user_column or cols.get("user_id")
+            if not uc or uc not in fetch_column_names(con, table):
+                return {"ok": False, "error": "User column unresolved.", "profile": profile}
 
-        last_lat, last_lon, last_ts = _last_login_lat_lon_time(con, table, cols, uc, uid)
+            last_lat, last_lon, last_ts = _last_login_lat_lon_time(con, table, cols, uc, uid)
 
-        if (
-            cur_lat is not None
-            and cur_lon is not None
-            and last_lat is not None
-            and last_lon is not None
-            and cur_ts
-            and last_ts
-        ):
-            dist = _haversine_miles(last_lat, last_lon, cur_lat, cur_lon)
-            dt_h = abs((cur_ts - last_ts).total_seconds()) / 3600.0
-            if dt_h > 1e-6:
-                mph = dist / dt_h
-                if mph > impossible_travel_mph_threshold:
+            if (
+                cur_lat is not None
+                and cur_lon is not None
+                and last_lat is not None
+                and last_lon is not None
+                and cur_ts
+                and last_ts
+            ):
+                dist = _haversine_miles(last_lat, last_lon, cur_lat, cur_lon)
+                dt_h = abs((cur_ts - last_ts).total_seconds()) / 3600.0
+                if dt_h > 1e-6:
+                    mph = dist / dt_h
+                    if mph > impossible_travel_mph_threshold:
+                        flags.append(
+                            {
+                                "code": "IMPOSSIBLE_TRAVEL",
+                                "severity": "critical",
+                                "public_label": _public_label_for_flag("IMPOSSIBLE_TRAVEL"),
+                                "detail": (
+                                    f"~{dist:.0f} mi in {dt_h * 60:.1f} min implies ~{mph:.0f} mph "
+                                    f"(threshold {impossible_travel_mph_threshold:.0f} mph). "
+                                    f"Prior point ({last_lat:.4f},{last_lon:.4f}) vs current ({cur_lat:.4f},{cur_lon:.4f})."
+                                ),
+                            }
+                        )
+                        discrepancies.append(
+                            {
+                                "field": "geo_velocity",
+                                "public_label": "Geographic anomaly: impossible travel",
+                                "baseline_label": "last_known_login",
+                                "baseline_value": f"{last_lat:.4f},{last_lon:.4f} @ {last_ts.isoformat()}",
+                                "current_value": f"{cur_lat:.4f},{cur_lon:.4f} @ {cur_ts.isoformat()}",
+                                "severity": "critical",
+                            }
+                        )
+                        travel_map = {
+                            "prior": {"lat": last_lat, "lon": last_lon, "label": "Last known session"},
+                            "current": {"lat": cur_lat, "lon": cur_lon, "label": "This login"},
+                            "distance_miles": round(dist, 1),
+                            "elapsed_hours": round(dt_h, 4),
+                            "implied_mph": round(mph, 0),
+                        }
+
+            top_uas = [x.get("user_agent") for x in dna.get("common_user_agents") or []][:3]
+            if cur_ua and top_uas:
+                if not any(cur_ua == u or cur_ua in str(u) for u in top_uas if u):
                     flags.append(
                         {
-                            "code": "IMPOSSIBLE_TRAVEL",
-                            "severity": "critical",
-                            "public_label": _public_label_for_flag("IMPOSSIBLE_TRAVEL"),
-                            "detail": (
-                                f"~{dist:.0f} mi in {dt_h * 60:.1f} min implies ~{mph:.0f} mph "
-                                f"(threshold {impossible_travel_mph_threshold:.0f} mph). "
-                                f"Prior point ({last_lat:.4f},{last_lon:.4f}) vs current ({cur_lat:.4f},{cur_lon:.4f})."
-                            ),
+                            "code": "USER_AGENT_MISMATCH",
+                            "severity": "high",
+                            "detail": f"Current UA not in user's top {len(top_uas)} historical UAs.",
                         }
                     )
                     discrepancies.append(
                         {
-                            "field": "geo_velocity",
-                            "public_label": "Geographic anomaly: impossible travel",
-                            "baseline_label": "last_known_login",
-                            "baseline_value": f"{last_lat:.4f},{last_lon:.4f} @ {last_ts.isoformat()}",
-                            "current_value": f"{cur_lat:.4f},{cur_lon:.4f} @ {cur_ts.isoformat()}",
-                            "severity": "critical",
+                            "field": "user_agent",
+                            "baseline_label": "top_historical_uas",
+                            "baseline_value": "; ".join(str(u) for u in top_uas if u),
+                            "current_value": cur_ua[:512],
+                            "severity": "high",
                         }
                     )
-                    travel_map = {
-                        "prior": {"lat": last_lat, "lon": last_lon, "label": "Last known session"},
-                        "current": {"lat": cur_lat, "lon": cur_lon, "label": "This login"},
-                        "distance_miles": round(dist, 1),
-                        "elapsed_hours": round(dt_h, 4),
-                        "implied_mph": round(mph, 0),
-                    }
 
-        top_uas = [x.get("user_agent") for x in dna.get("common_user_agents") or []][:3]
-        if cur_ua and top_uas:
-            if not any(cur_ua == u or cur_ua in str(u) for u in top_uas if u):
-                flags.append(
-                    {
-                        "code": "USER_AGENT_MISMATCH",
-                        "severity": "high",
-                        "detail": f"Current UA not in user's top {len(top_uas)} historical UAs.",
-                    }
-                )
-                discrepancies.append(
-                    {
-                        "field": "user_agent",
-                        "baseline_label": "top_historical_uas",
-                        "baseline_value": "; ".join(str(u) for u in top_uas if u),
-                        "current_value": cur_ua[:512],
-                        "severity": "high",
-                    }
-                )
+            top_screens = [x.get("resolution") for x in dna.get("common_screen_resolutions") or []][:3]
+            if cur_screen and top_screens:
+                if cur_screen not in top_screens:
+                    flags.append(
+                        {
+                            "code": "SCREEN_ENV_MISMATCH",
+                            "severity": "medium",
+                            "detail": "Screen resolution outside top historical configurations.",
+                        }
+                    )
+                    discrepancies.append(
+                        {
+                            "field": "screen_resolution",
+                            "baseline_label": "top_resolutions",
+                            "baseline_value": ", ".join(str(s) for s in top_screens if s),
+                            "current_value": cur_screen,
+                            "severity": "medium",
+                        }
+                    )
 
-        top_screens = [x.get("resolution") for x in dna.get("common_screen_resolutions") or []][:3]
-        if cur_screen and top_screens:
-            if cur_screen not in top_screens:
-                flags.append(
-                    {
-                        "code": "SCREEN_ENV_MISMATCH",
-                        "severity": "medium",
-                        "detail": "Screen resolution outside top historical configurations.",
-                    }
+            top_isps = [x.get("isp") for x in dna.get("typical_isps") or []][:3]
+            if cur_isp:
+                hosting = bool(current_session_data.get("is_hosting_or_proxy")) or bool(
+                    _HOSTING_RE.search(cur_isp)
                 )
-                discrepancies.append(
-                    {
-                        "field": "screen_resolution",
-                        "baseline_label": "top_resolutions",
-                        "baseline_value": ", ".join(str(s) for s in top_screens if s),
-                        "current_value": cur_screen,
-                        "severity": "medium",
-                    }
-                )
+                if hosting:
+                    flags.append(
+                        {
+                            "code": "HOSTING_OR_PROXY_ISP",
+                            "severity": "high",
+                            "detail": f"Session ISP/org suggests hosting/VPN/datacenter pattern: {cur_isp!r}.",
+                        }
+                    )
+                    discrepancies.append(
+                        {
+                            "field": "isp_reputation",
+                            "baseline_label": "typical_residential_isps",
+                            "baseline_value": ", ".join(str(i) for i in top_isps if i) or "(none inferred)",
+                            "current_value": cur_isp,
+                            "severity": "high",
+                        }
+                    )
+                elif top_isps and not any(
+                    str(t).lower() in cur_isp.lower() or cur_isp.lower() in str(t).lower() for t in top_isps if t
+                ):
+                    flags.append(
+                        {
+                            "code": "ISP_MISMATCH",
+                            "severity": "medium",
+                            "detail": "ISP/org diverges from typical user networks.",
+                        }
+                    )
+                    discrepancies.append(
+                        {
+                            "field": "isp",
+                            "baseline_label": "top_isps",
+                            "baseline_value": ", ".join(str(i) for i in top_isps if i),
+                            "current_value": cur_isp,
+                            "severity": "medium",
+                        }
+                    )
 
-        top_isps = [x.get("isp") for x in dna.get("typical_isps") or []][:3]
-        if cur_isp:
-            hosting = bool(current_session_data.get("is_hosting_or_proxy")) or bool(_HOSTING_RE.search(cur_isp))
-            if hosting:
-                flags.append(
-                    {
-                        "code": "HOSTING_OR_PROXY_ISP",
-                        "severity": "high",
-                        "detail": f"Session ISP/org suggests hosting/VPN/datacenter pattern: {cur_isp!r}.",
-                    }
-                )
-                discrepancies.append(
-                    {
-                        "field": "isp_reputation",
-                        "baseline_label": "typical_residential_isps",
-                        "baseline_value": ", ".join(str(i) for i in top_isps if i) or "(none inferred)",
-                        "current_value": cur_isp,
-                        "severity": "high",
-                    }
-                )
-            elif top_isps and not any(
-                str(t).lower() in cur_isp.lower() or cur_isp.lower() in str(t).lower() for t in top_isps if t
-            ):
-                flags.append(
-                    {
-                        "code": "ISP_MISMATCH",
-                        "severity": "medium",
-                        "detail": "ISP/org diverges from typical user networks.",
-                    }
-                )
-                discrepancies.append(
-                    {
-                        "field": "isp",
-                        "baseline_label": "top_isps",
-                        "baseline_value": ", ".join(str(i) for i in top_isps if i),
-                        "current_value": cur_isp,
-                        "severity": "medium",
-                    }
-                )
+            trusted_hw = [x.get("hardware_id") for x in dna.get("trusted_devices_hardware_ids") or []]
+            if cur_hw and trusted_hw:
+                ch = str(cur_hw)
+                if not any(ch == str(h) for h in trusted_hw if h):
+                    flags.append(
+                        {
+                            "code": "NEW_HARDWARE_ID",
+                            "severity": "low",
+                            "detail": "First-seen hardware/device id for this account in dataset — elevate with other red flags.",
+                        }
+                    )
+                    discrepancies.append(
+                        {
+                            "field": "hardware_id",
+                            "baseline_label": "known_device_ids",
+                            "baseline_value": ", ".join(str(h) for h in trusted_hw[:5] if h),
+                            "current_value": ch[:256],
+                            "severity": "low",
+                        }
+                    )
 
-        trusted_hw = [x.get("hardware_id") for x in dna.get("trusted_devices_hardware_ids") or []]
-        if cur_hw and trusted_hw:
-            ch = str(cur_hw)
-            if not any(ch == str(h) for h in trusted_hw if h):
-                flags.append(
-                    {
-                        "code": "NEW_HARDWARE_ID",
-                        "severity": "low",
-                        "detail": "First-seen hardware/device id for this account in dataset — elevate with other red flags.",
-                    }
-                )
-                discrepancies.append(
-                    {
-                        "field": "hardware_id",
-                        "baseline_label": "known_device_ids",
-                        "baseline_value": ", ".join(str(h) for h in trusted_hw[:5] if h),
-                        "current_value": ch[:256],
-                        "severity": "low",
-                    }
-                )
-
-    finally:
-        con.close()
+        finally:
+            con.close()
 
     # --- Sensitive action chain (session payload; not always in CSV) ---
     events = current_session_data.get("events") or []
@@ -533,6 +545,12 @@ def analyze_ato_risk(
         "Credentials may be valid while **environment** diverges from baseline (ISP/UA/geo).",
         "Prioritize **freezing high-risk rails** when sensitive changes precede cash-out sized moves.",
     ]
+
+    canvas_ip: dict[str, Any] | None = None
+    try:
+        canvas_ip = analyze_canvas_ip_velocity(path, table=table)
+    except Exception:
+        canvas_ip = {"ok": False, "error": "canvas_ip_velocity_failed"}
     if any(f["code"] == "IMPOSSIBLE_TRAVEL" for f in flags):
         narrative_hints.append(
             "Cite **impossible travel** with prior vs current coordinates and elapsed time for SOC escalation."
@@ -566,4 +584,5 @@ def analyze_ato_risk(
         "notification_recipient_email": notify_email,
         "narrative_hints": narrative_hints,
         "thresholds": {"impossible_travel_mph": impossible_travel_mph_threshold},
+        "canvas_ip_velocity": canvas_ip,
     }

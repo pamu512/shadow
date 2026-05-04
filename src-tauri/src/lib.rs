@@ -17,20 +17,18 @@ pub fn run() {
             .build(),
         );
       }
-      start_sidecar(app.handle())?;
+      start_sidecar(app.handle()).map_err(|e| {
+        log::error!("{e}");
+        e
+      })?;
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_api_base_url])
+    .invoke_handler(tauri::generate_handler![get_api_base_url, restart_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
       if let RunEvent::Exit = event {
-        if let Ok(mut guard) = app_handle.state::<SidecarChild>().0.lock() {
-          if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-          }
-        }
+        let _ = stop_tracked_sidecar(app_handle);
       }
     });
 }
@@ -78,7 +76,16 @@ fn resolve_python(app: &AppHandle) -> std::path::PathBuf {
   std::path::PathBuf::from("python3")
 }
 
-fn start_sidecar(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+/// Dev builds listen on all interfaces so both `localhost` and `127.0.0.1` reach the API; release stays loopback-only.
+fn uvicorn_bind_host() -> &'static str {
+  if cfg!(debug_assertions) {
+    "0.0.0.0"
+  } else {
+    "127.0.0.1"
+  }
+}
+
+fn build_uvicorn_command(app: &AppHandle) -> std::process::Command {
   let port = std::env::var("SHADOW_API_PORT").unwrap_or_else(|_| "8742".to_string());
   let root = project_root();
   let python = resolve_python(app);
@@ -87,7 +94,7 @@ fn start_sidecar(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     .arg("uvicorn")
     .arg("backend.main:app")
     .arg("--host")
-    .arg("127.0.0.1")
+    .arg(uvicorn_bind_host())
     .arg("--port")
     .arg(&port)
     .current_dir(&root);
@@ -98,25 +105,92 @@ fn start_sidecar(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
   path_var.push_str(root.to_string_lossy().as_ref());
   cmd.env("PYTHONPATH", path_var);
   cmd.env("SHADOW_API_PORT", &port);
+  cmd
+}
 
-  log::info!("spawning sidecar: {:?} (cwd={:?})", python, root);
-  let child = cmd.spawn()?;
+fn spawn_and_track_sidecar(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+  let mut cmd = build_uvicorn_command(app);
+  let root = project_root();
+  let python = resolve_python(app);
+  log::info!(
+    "spawning sidecar: {:?} (cwd={:?}) host={}",
+    python,
+    root,
+    uvicorn_bind_host()
+  );
+  let mut child = cmd.spawn()?;
+  std::thread::sleep(Duration::from_millis(450));
+  if let Ok(Some(status)) = child.try_wait() {
+    return Err(
+      format!(
+        "Python sidecar exited immediately (status: {status}). Confirm `.venv` exists and `PYTHONPATH` includes the repo root; from the repo run: `.venv/bin/python -m uvicorn backend.main:app --host 127.0.0.1 --port {}`",
+        sidecar_api_port()
+      )
+      .into(),
+    );
+  }
   if let Some(state) = app.try_state::<SidecarChild>() {
     if let Ok(mut g) = state.0.lock() {
       *g = Some(child);
     }
   }
+  Ok(())
+}
 
+fn stop_tracked_sidecar(app: &AppHandle) -> Result<(), String> {
+  let Some(state) = app.try_state::<SidecarChild>() else {
+    return Err("Sidecar state not initialized.".into());
+  };
+  let mut g = state.0.lock().map_err(|_| "Sidecar mutex poisoned.".to_string())?;
+  if let Some(mut child) = g.take() {
+    let _ = child.kill();
+    let _ = child.wait();
+  }
+  Ok(())
+}
+
+fn wait_sidecar_tcp(port: &str) -> bool {
   let addr = format!("127.0.0.1:{}", port);
   for _ in 0..80 {
     if std::net::TcpStream::connect(&addr).is_ok() {
       log::info!("sidecar accepting TCP on {}", addr);
-      return Ok(());
+      return true;
     }
     std::thread::sleep(Duration::from_millis(200));
   }
   log::warn!("sidecar TCP probe timed out");
+  false
+}
+
+fn start_sidecar(app: &AppHandle) -> Result<(), String> {
+  spawn_and_track_sidecar(app).map_err(|e| e.to_string())?;
+  let port = sidecar_api_port();
+  if !wait_sidecar_tcp(&port) {
+    let _ = stop_tracked_sidecar(app);
+    return Err(format!(
+      "Python API did not become reachable on 127.0.0.1:{} within ~16s. \
+Ensure port is free, `.venv` exists, and from the repo root: \
+export PYTHONPATH=\"$(pwd)\" && .venv/bin/python -m uvicorn backend.main:app --host 127.0.0.1 --port {}",
+      port, port
+    ));
+  }
   Ok(())
+}
+
+/// Stop the tracked uvicorn child (if any), spawn a fresh one, and wait until TCP accepts on the API port.
+#[tauri::command]
+fn restart_sidecar(app: AppHandle) -> Result<String, String> {
+  stop_tracked_sidecar(&app)?;
+  std::thread::sleep(Duration::from_millis(500));
+  spawn_and_track_sidecar(&app).map_err(|e| format!("Failed to spawn sidecar: {e}"))?;
+  let port = sidecar_api_port();
+  if !wait_sidecar_tcp(&port) {
+    return Err(format!(
+      "Python API did not become reachable on 127.0.0.1:{} within ~16s. Another process may be holding the port—quit it or change SHADOW_API_PORT.",
+      port
+    ));
+  }
+  Ok(format!("Python API restarted on 127.0.0.1:{}.", port))
 }
 
 #[tauri::command]

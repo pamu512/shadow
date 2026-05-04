@@ -6,9 +6,12 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from backend.database import get_db
+from backend.database.dataset_path_resolve import resolve_with_active_fallback_async
 from backend.database.models import Case
 from backend.tools.network_analyzer import export_fraud_ring_network, find_fraud_rings
 
@@ -28,24 +31,27 @@ class NetworkExportRequest(NetworkRingsRequest):
     export_format: Literal["gexf", "graphml"] = Field(default="gexf", description="GEXF (Gephi) or GraphML interchange.")
 
 
-def _get_case(case_id: str, db: Session) -> Case:
-    row = db.query(Case).filter(Case.id == case_id).first()
+async def _get_case(case_id: str, db: AsyncSession) -> Case:
+    r = await db.execute(select(Case).where(Case.id == case_id))
+    row = r.scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="Case not found")
     return row
 
 
 @router.post("/{case_id}/network/rings")
-def post_network_rings(
+async def post_network_rings(
     case_id: str,
     body: NetworkRingsRequest = NetworkRingsRequest(),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    case = _get_case(case_id, db)
-    if not case.dataset_path:
+    case = await _get_case(case_id, db)
+    path = await resolve_with_active_fallback_async(db, case.dataset_path)
+    if not path:
         raise HTTPException(status_code=400, detail="Case has no dataset_path; upload a CSV first.")
-    return find_fraud_rings(
-        case.dataset_path,
+    return await run_in_threadpool(
+        find_fraud_rings,
+        path,
         account_column=body.account_column,
         payer_column=body.payer_column,
         payee_column=body.payee_column,
@@ -53,23 +59,23 @@ def post_network_rings(
     )
 
 
-@router.post("/{case_id}/network/export")
-def post_network_export(
+def _export_network_sync(
+    path: str,
+    export_format: str,
+    account_column: str | None,
+    payer_column: str | None,
+    payee_column: str | None,
+    amount_column: str | None,
     case_id: str,
-    body: NetworkExportRequest = NetworkExportRequest(),
-    db: Session = Depends(get_db),
 ) -> Response:
-    case = _get_case(case_id, db)
-    if not case.dataset_path:
-        raise HTTPException(status_code=400, detail="Case has no dataset_path; upload a CSV first.")
     try:
         data, ext = export_fraud_ring_network(
-            case.dataset_path,
-            body.export_format,
-            account_column=body.account_column,
-            payer_column=body.payer_column,
-            payee_column=body.payee_column,
-            amount_column=body.amount_column,
+            path,
+            export_format,
+            account_column=account_column,
+            payer_column=payer_column,
+            payee_column=payee_column,
+            amount_column=amount_column,
         )
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Dataset file missing on disk.") from None
@@ -81,4 +87,26 @@ def post_network_export(
         content=data,
         media_type="application/xml",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@router.post("/{case_id}/network/export")
+async def post_network_export(
+    case_id: str,
+    body: NetworkExportRequest = NetworkExportRequest(),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    case = await _get_case(case_id, db)
+    path = await resolve_with_active_fallback_async(db, case.dataset_path)
+    if not path:
+        raise HTTPException(status_code=400, detail="Case has no dataset_path; upload a CSV first.")
+    return await run_in_threadpool(
+        _export_network_sync,
+        path,
+        body.export_format,
+        body.account_column,
+        body.payer_column,
+        body.payee_column,
+        body.amount_column,
+        case_id,
     )
