@@ -22,7 +22,16 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = 8742
     data_dir: Path = Field(default_factory=lambda: _repo_root() / ".data")
-    database_url: str = ""
+    database_url: str = Field(
+        default="",
+        description=(
+            "Canonical SQLAlchemy URL for the **sync** engine (migrations, LangGraph, legacy sync paths). "
+            "Use `sqlite:///…` or `postgresql+psycopg://…` (or `postgresql://…`). "
+            "FastAPI uses **AsyncSession**; `backend/database/session.py` derives "
+            "`sqlite+aiosqlite://…` or `postgresql+asyncpg://…` from this value—do not set the async "
+            "form here or the sync engine will not start."
+        ),
+    )
     workspace_dir: Path = Field(default_factory=lambda: _repo_root() / "workspace")
     ollama_base_url: str = "http://localhost:11434/v1"
     ollama_model: str = "llama3.2"
@@ -30,7 +39,10 @@ class Settings(BaseSettings):
     debug_agent: bool = False
     llm_tool_confidence: bool = Field(
         default=False,
-        description="If True, use LLM structured output for per-tool confidence (RFI). If False, use fast deterministic heuristics.",
+        description=(
+            "If True, use LLM structured output for per-tool confidence (RFI). "
+            "If False, prefer ONNX (`tool_confidence.onnx` under data_dir) when present, else heuristics."
+        ),
     )
     ingestion_provider: Literal["local", "tarka", "auto"] = Field(
         default="local",
