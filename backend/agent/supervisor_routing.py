@@ -35,6 +35,7 @@ _SEMANTIC_PROTOTYPES: dict[AgentName, tuple[str, ...]] = {
         "account takeover session risk behavioral profile",
         "fraud ring graph louvain bot cluster hardware fingerprint",
         "warehouse historical overlap recidivist",
+        "who owns this ip address asn isp which organization registered that ip",
     ),
 }
 
@@ -47,13 +48,13 @@ def _get_cached_prototype_embeddings() -> dict[AgentName, list[list[float]]]:
     with _CACHE_LOCK:
         if _CACHED_PROTOTYPE_EMBEDDINGS:
             return _CACHED_PROTOTYPE_EMBEDDINGS
-        
+
         # Build cache
         for agent, protos in _SEMANTIC_PROTOTYPES.items():
             embs = _embed_texts(list(protos))
             if embs:
                 _CACHED_PROTOTYPE_EMBEDDINGS[agent] = [_l2_normalize(e) for e in embs]
-        
+
         return _CACHED_PROTOTYPE_EMBEDDINGS
 
 
@@ -111,11 +112,11 @@ def semantic_route_fallback(user_text: str) -> AgentName:
     if not q_emb:
         return _keyword_route_fallback(user_text)
     qv = _l2_normalize(q_emb[0])
-    
+
     cached_protos = _get_cached_prototype_embeddings()
     if not cached_protos:
         return _keyword_route_fallback(user_text)
-        
+
     best: AgentName = "analyst"
     best_score = -1.0
     for agent, proto_embs in cached_protos.items():
