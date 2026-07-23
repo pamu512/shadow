@@ -1,6 +1,8 @@
-# Shadow
+# Shadow (desktop forensics)
 
-**Shadow** is a **local-first forensic operations console** for fraud and disputes. It combines a **React** workspace, an optional **Tauri 2** desktop shell, and a **Python FastAPI** sidecar that runs **Polars**, **DuckDB**, **NetworkX**, **scikit-learn**, and a **LangGraph / LangChain** agent—without sending case data to the cloud by default.
+**Analyst workstation only** — not the production ingest Shadow. Ingest HTTP is [`services/shadow_agent`](../../services/shadow_agent/); brand map: [`services/SHADOW.md`](../../services/SHADOW.md).
+
+**Shadow** here is a **local-first forensic operations console** for fraud and disputes. It combines a **React** workspace, an optional **Tauri 2** desktop shell, and a **Python FastAPI** sidecar that runs **Polars**, **DuckDB**, **NetworkX**, **scikit-learn**, and a **LangGraph / LangChain** agent—without sending case data to the cloud by default.
 
 ---
 

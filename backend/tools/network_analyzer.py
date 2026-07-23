@@ -193,7 +193,7 @@ def _analyze_ring_graph_from_polars(
         cycle_nodes: set[str] = set()
         for cyc in cycles:
             cycle_nodes.update(cyc)
-        cycle_count = {n: 0 for n in cycle_nodes}
+        cycle_count = dict.fromkeys(cycle_nodes, 0)
         for cyc in cycles:
             for n in cyc:
                 cycle_count[n] = cycle_count.get(n, 0) + 1

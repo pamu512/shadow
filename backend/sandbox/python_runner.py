@@ -33,7 +33,7 @@ def run_python_subprocess(
     env["MPLBACKEND"] = "Agg"
     script_body = (
         "import os\n"
-        f"PLOT_DIR = os.environ['FRAUD_PLOT_DIR']\n"
+        "PLOT_DIR = os.environ['FRAUD_PLOT_DIR']\n"
         "DATASET_PATH = os.environ.get('FRAUD_DATASET_PATH', '')\n"
         + code
         + "\n"
