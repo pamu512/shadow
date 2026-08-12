@@ -352,13 +352,14 @@ def find_circular_payment_paths_lazyframe(
     }
 
 
-# Back-compat names (older stubs)
+# Back-compat names (older stubs) — fail closed, never return invent-data strings.
 def network_analysis_stub() -> str:
-    return (
-        "Use find_circular_payment_paths(dataset_path, payer_col=..., payee_col=...) "
-        "for Polars + NetworkX circular payment detection."
+    raise NotImplementedError(
+        "Use find_circular_payment_paths(...); network_analysis_stub refuses stub string output"
     )
 
 
 def graph_clustering_stub() -> str:
-    return "stub: graph_clustering_louvain — not implemented yet."
+    raise NotImplementedError(
+        "graph_clustering_louvain is not implemented; refuse stub string as analytic output"
+    )

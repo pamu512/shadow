@@ -1,12 +1,17 @@
-"""Chargeback Specialist — reason codes, ARN timelines, representment (stub)."""
-from __future__ import annotations
+"""Chargeback Specialist — reason codes, ARN timelines, representment.
 
-# Future: Polars rollups, DuckDB window queries, R if needed.
+Specialized analytics are not wired yet; callers must not treat stub strings as results.
+"""
+from __future__ import annotations
 
 
 def reason_code_rollups_stub() -> str:
-    return "stub: reason_code_rollups"
+    raise NotImplementedError(
+        "Chargeback reason_code_rollups is not implemented; refuse stub string"
+    )
 
 
 def arn_dedup_timeline_stub() -> str:
-    return "stub: arn_dedup_timeline"
+    raise NotImplementedError(
+        "Chargeback arn_dedup_timeline is not implemented; refuse stub string"
+    )

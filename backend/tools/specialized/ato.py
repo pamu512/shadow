@@ -1,10 +1,17 @@
-"""ATO Investigator — sessions, device graphs, velocity (stub)."""
+"""ATO Investigator — sessions, device graphs, velocity.
+
+Specialized analytics are not wired yet; callers must not treat stub strings as results.
+"""
 from __future__ import annotations
 
 
 def ip_velocity_stub() -> str:
-    return "stub: ip_velocity"
+    raise NotImplementedError(
+        "ATO ip_velocity is not implemented; refuse stub string as analytic output"
+    )
 
 
 def device_fingerprint_graph_stub() -> str:
-    return "stub: device_fingerprint_graph"
+    raise NotImplementedError(
+        "ATO device_fingerprint_graph is not implemented; refuse stub string as analytic output"
+    )

@@ -1,10 +1,17 @@
-"""Collusion Expert — counterparty graphs, circular flows (stub)."""
+"""Collusion Expert — counterparty graphs, circular flows.
+
+Specialized analytics are not wired yet; callers must not treat stub strings as results.
+"""
 from __future__ import annotations
 
 
 def bipartite_counterparty_graph_stub() -> str:
-    return "stub: bipartite_counterparty_graph"
+    raise NotImplementedError(
+        "Collusion bipartite_counterparty_graph is not implemented; refuse stub string"
+    )
 
 
 def circular_flow_detection_stub() -> str:
-    return "stub: circular_flow_detection"
+    raise NotImplementedError(
+        "Collusion circular_flow_detection is not implemented; refuse stub string"
+    )
