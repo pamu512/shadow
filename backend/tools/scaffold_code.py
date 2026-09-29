@@ -247,7 +247,7 @@ df = pl.read_csv(DATA_PATH, try_parse_dates=True)
 {body}
 out = result.collect()
 print(out.head(50))
-# Optional: plt.savefig(os.path.join(PLOT_DIR, "out.png")) — PLOT_DIR injected in sandbox
+# Optional: plt.savefig(f"{{PLOT_DIR}}/out.png") — PLOT_DIR injected in sandbox
 '''
     else:
         code = f'''"""Auto-generated Polars pipeline.

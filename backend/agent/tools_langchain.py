@@ -93,7 +93,7 @@ def execute_in_sandbox(language: Literal["python", "r"], code: str) -> str:
     """Execute Python or R inside the workspace sandbox. Python may **import polars, pandas, numpy, matplotlib**, and
     other allowlisted stdlib-style modules (see sandbox policy). For Bot Hunter, prefer **Polars** or **pandas** on the
     active CSV path from context for GROUP BY / value_counts. For **matplotlib**, `MPLBACKEND=Agg` is set; to return a
-    plot to the UI, call **`plt.savefig(os.path.join(PLOT_DIR, 'out.png'))`** — `PLOT_DIR` is injected at the top of the
+    plot to the UI, call **`plt.savefig(f"{PLOT_DIR}/out.png")`** — `PLOT_DIR` is injected at the top of the
     script (same as env `FRAUD_PLOT_DIR`). `plt.show()` alone may not emit a captured image. Summarize printed stdout
     only—do not invent metrics."""
     out = execute_code(language, code, timeout_sec=120)
