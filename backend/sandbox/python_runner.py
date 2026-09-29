@@ -4,8 +4,6 @@ from __future__ import annotations
 import base64
 import os
 import shutil
-import subprocess
-import sys
 import uuid
 from pathlib import Path
 
@@ -31,16 +29,16 @@ def run_python_subprocess(
     env = os.environ.copy()
     env["FRAUD_PLOT_DIR"] = str(out_dir)
     env["MPLBACKEND"] = "Agg"
+    # ponytail: bind only plot/dataset paths; do not leave `os` in user globals (upgrade: pathlib helper)
     script_body = (
-        "import os\n"
-        "PLOT_DIR = os.environ['FRAUD_PLOT_DIR']\n"
-        "DATASET_PATH = os.environ.get('FRAUD_DATASET_PATH', '')\n"
+        "PLOT_DIR = __import__('os').environ['FRAUD_PLOT_DIR']\n"
+        "DATASET_PATH = __import__('os').environ.get('FRAUD_DATASET_PATH', '')\n"
         + code
         + "\n"
     )
     use_docker = settings.sandbox_mode == "docker" and shutil.which("docker") is not None
     use_pyodide = settings.sandbox_mode == "pyodide" and shutil.which("node") is not None
-    
+
     if use_docker:
         from backend.sandbox.docker_runner import run_python_in_docker
 
@@ -56,32 +54,34 @@ def run_python_subprocess(
             return rc, out, err, plots, []
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
-        
+
+    if not use_pyodide:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return (
+            1,
+            "",
+            "Sandbox backend unavailable: isolated Python requires "
+            "SHADOW_SANDBOX_MODE=pyodide with Node.js on PATH, or "
+            "SHADOW_SANDBOX_MODE=docker with Docker on PATH. "
+            "Host subprocess execution is disabled.",
+            [],
+            [],
+        )
+
     cwd_dir = settings.workspace_dir / f"cwd_{uuid.uuid4().hex}"
     cwd_dir.mkdir(parents=True, exist_ok=True)
     script_path = cwd_dir / f"run_{uuid.uuid4().hex}.py"
     script_path.write_text(script_body, encoding="utf-8")
 
     try:
-        if use_pyodide:
-            from backend.sandbox.pyodide_runner import run_python_in_pyodide
+        from backend.sandbox.pyodide_runner import run_python_in_pyodide
 
-            rc, out, err = run_python_in_pyodide(
-                script_path,
-                timeout_sec=timeout_sec,
-                workspace=cwd_dir,
-                dataset_path=env.get("FRAUD_DATASET_PATH", ""),
-            )
-        else:
-            proc = subprocess.run(
-                [sys.executable, str(script_path)],
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-                cwd=str(cwd_dir),
-                env=env,
-            )
-            rc, out, err = proc.returncode, proc.stdout or "", proc.stderr or ""
+        rc, out, err = run_python_in_pyodide(
+            script_path,
+            timeout_sec=timeout_sec,
+            workspace=cwd_dir,
+            dataset_path=env.get("FRAUD_DATASET_PATH", ""),
+        )
 
         plots = [base64.b64encode(png.read_bytes()).decode("ascii") for png in sorted(out_dir.glob("*.png"))]
         violations: list[str] = []
