@@ -250,4 +250,4 @@ Python: keep **3.11+** compatibility; run tests from your branch when present. A
 
 ## License
 
-No `LICENSE` file is included in this repository yet; add one before distribution.
+MIT — see [LICENSE](LICENSE).
